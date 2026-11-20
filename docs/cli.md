@@ -43,7 +43,7 @@ error. Positional arguments and options may appear in any order.
 |---|---|---|
 | `--org <id \| name>` | every workspace command | The workspace to act on. Falls back to the `CONCORD_ORG` environment variable. |
 | `--json` | see [`--json` coverage](#--json-coverage) | Print machine-readable JSON. |
-| `--network mainnet\|testnet` | `watch` | Network of the asset. Defaults to `CONCORD_DEFAULT_NETWORK`, itself defaulting to `mainnet`. |
+| `--network mainnet\|testnet` | `watch`, `reconcile-all` | For `watch`, the network of the asset, defaulting to `CONCORD_DEFAULT_NETWORK` (itself defaulting to `mainnet`). For `reconcile-all`, only run the assets on this network; every network when absent. |
 | `--name <text>` | `watch` | Display name. Defaults to the asset code. |
 | `--ignore A,B` | `watch` | Comma-separated addresses to leave out of reconciliation (treasury, issuer). |
 | `--from <ledger>` | `watch` | Start indexing at this ledger instead of taking opening balances. |
@@ -51,6 +51,7 @@ error. Positional arguments and options may appear in any order.
 | `--decimals <0-18>` | `watch` | Decimals of a contract token that does not state them. Classic assets always have 7. |
 | `--as-of <ISO>` | `holdings`, `register` | Point in time. Required by `register`. |
 | `--register <id>` | `reconcile` | Reconcile this register import instead of the latest. |
+| `--fail-on-breaks` | `reconcile-all` | Exit `1` when any asset's latest reconciliation leaves an open break. |
 | `--record <ISO>` | `action` | Record time: holdings at this instant are the entitlement basis. Required. |
 | `--rate <decimal>` | `action ... dividend` | Pay-asset units per whole unit held. Required for a dividend. |
 | `--pay-asset <asset>` | `action ... dividend` | Watched asset the dividend is paid in, on the same network. Defaults to the asset itself. |
@@ -78,7 +79,7 @@ A workspace is named by `--org` (its id, or its exact name) or `CONCORD_ORG`. A 
 two workspaces is refused: use the id (`Auth.findOrg`, `services/api/src/auth.ts`).
 
 - **Need a workspace:** `watch`, `unwatch`, `rebuild`, `assets`, `holdings`, `register`,
-  `journal`, `instructions`, `reconcile`, `action`, `actions`, `controls`, `export`.
+  `journal`, `instructions`, `reconcile`, `reconcile-all`, `action`, `actions`, `controls`, `export`.
 - **`sync`:** with an `ASSET`, needs a workspace. With no `ASSET` it syncs every asset in the
   named workspace, or every workspace when none is named (and then also advances any corporate
   action whose record time the indexed chain has passed).
@@ -192,6 +193,21 @@ object: `status` is `clean` or `breaks`, with `summary`, `lines`, `movement` and
 
 A reconciliation that finds breaks still exits `0`. See [Exit codes](#exit-codes).
 
+### `reconcile-all [--network N] [--fail-on-breaks]`
+
+Runs `reconcile` for every watched asset that has a register imported, in one command. Assets
+without a register are skipped, since there is nothing to compare them against. A failing asset
+is recorded with its error and the rest still run.
+
+Human output: a table with one row per asset (asset id, code, network, status, run id, as-of
+time, open breaks, error), then a line counting the assets, the clean runs, the runs with breaks,
+the failures and the open breaks. With `--json`, an object with `network`, `results` (the same
+rows as an array) and `totals`.
+
+The command exits `0` when every asset reconciled. It exits `1` when an asset failed, and with
+`--fail-on-breaks` it also exits `1` when any asset's latest run has an open break. Signed-off
+breaks do not count as open. See [Exit codes](#exit-codes).
+
 ### `action ASSET <dividend|split|redemption> --record ISO ...`
 
 Records a corporate action and reconciles it.
@@ -274,6 +290,7 @@ Runs the API and dashboard, the same as `pnpm start` does for the built output.
 | Command | `--json` |
 |---|---|
 | `holdings`, `reconcile`, `action`, `controls` | Whole result as JSON instead of tables. |
+| `reconcile-all` | The per-asset results and totals as JSON instead of the table and count line. |
 | `register` | The reconciliation becomes JSON, but the import summary lines come first as text. |
 | `sync`, `journal`, `instructions` | Always JSON; the flag changes nothing. |
 | `export` | Always JSON unless `--csv`; the flag changes nothing. |
@@ -289,6 +306,8 @@ workspace or asset that does not exist, a CSV that cannot be read at all, a dest
 (`unwatch`, `org-delete`) run without `--yes` on a non-interactive stdin, and a Stellar RPC
 failure that stops the command. A command that finds reconciliation breaks still exits `0`, so a
 script that cares has to read the result (`status` in the `--json` output of `reconcile`).
+`reconcile-all` is the exception: `--fail-on-breaks` makes open breaks exit `1`, and an asset it
+could not reconcile exits `1` either way.
 
 ## Daily reconciliation from cron
 

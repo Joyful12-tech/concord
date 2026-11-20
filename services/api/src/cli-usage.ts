@@ -20,6 +20,8 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   journal ASSET FILE               import the register's transaction journal
   instructions ASSET FILE          import control instructions
   reconcile ASSET [--register ID]  re-run a reconciliation
+  reconcile-all [--network N] [--fail-on-breaks]
+                                   re-run every asset's latest register
   action ASSET dividend --record ISO --rate R [--pay-asset A] [--payer G...] [--until ISO]
   action ASSET split|redemption --record ISO --ratio NUM:DEN [--until ISO]
         [--label TEXT] [--exclude A,B]
@@ -42,4 +44,7 @@ ASSET is a code or a contract id. Add --json to most commands for machine-readab
 or --help (-h) to see this text. Settings come from the environment; see .env.example.
 
 unwatch and org-delete print what they would remove and delete nothing until --yes is given
-(or the prompt is answered on a terminal); --dry-run prints the counts and stops.`;
+(or the prompt is answered on a terminal); --dry-run prints the counts and stops.
+
+reconcile-all continues past an asset that fails and exits 1 when one did; with --fail-on-breaks
+it also exits 1 when any asset's latest reconciliation leaves an open break.`;

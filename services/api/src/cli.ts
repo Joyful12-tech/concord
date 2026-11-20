@@ -41,6 +41,7 @@ async function main(): Promise<void> {
       out: { type: "string" },
       note: { type: "string" },
       json: { type: "boolean" },
+      "fail-on-breaks": { type: "boolean" },
       yes: { type: "boolean", short: "y" },
       "dry-run": { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -224,6 +225,82 @@ async function main(): Promise<void> {
     case "reconcile":
       printRun(await workspace().reconcile(need(a, "asset"), values.register ? Number(values.register) : undefined, actor));
       break;
+    case "reconcile-all": {
+      const network = values.network;
+      if (network !== undefined && !isNetworkName(network)) throw new Error("--network must be mainnet or testnet");
+      const concord = workspace();
+      // Only assets with an imported register can be reconciled, and a failing asset is
+      // recorded and stepped over so the rest of the workspace still runs.
+      const withRegister = new Set(
+        concord.db.all<{ asset_id: string }>("SELECT DISTINCT asset_id FROM registers").map((r) => r.asset_id),
+      );
+      const assets = concord.assets(network).filter((asset) => withRegister.has(asset.id));
+      type Result = {
+        asset: string;
+        code: string;
+        network: string;
+        status: "clean" | "breaks" | "error";
+        runId: number | null;
+        asOf: string | null;
+        openBreaks: number;
+        error: string | null;
+      };
+      const results: Result[] = [];
+      for (const asset of assets) {
+        const row = { asset: asset.id, code: asset.code, network: asset.network };
+        try {
+          const run = await concord.reconcile(asset.id, undefined, actor);
+          results.push({
+            ...row,
+            status: run.status,
+            runId: run.id,
+            asOf: run.asOf,
+            openBreaks: run.openBreaks,
+            error: null,
+          });
+        } catch (err) {
+          results.push({
+            ...row,
+            status: "error",
+            runId: null,
+            asOf: null,
+            openBreaks: 0,
+            error: (err as Error).message,
+          });
+        }
+      }
+      const count = (status: Result["status"]) => results.filter((r) => r.status === status).length;
+      const openBreaks = results.reduce((n, r) => n + r.openBreaks, 0);
+      if (values.json) {
+        out({
+          network: network ?? null,
+          results,
+          totals: {
+            assets: results.length,
+            clean: count("clean"),
+            breaks: count("breaks"),
+            failed: count("error"),
+            openBreaks,
+          },
+        });
+      } else if (results.length === 0) {
+        console.log("no watched asset has a register imported");
+      } else {
+        table(results);
+        console.log(
+          [
+            `${results.length} assets with a register`,
+            `${count("clean")} clean`,
+            `${count("breaks")} with breaks`,
+            `${count("error")} failed`,
+            `${openBreaks} open breaks`,
+          ].join(" · "),
+        );
+      }
+      // A failed asset is an error; unresolved breaks are only one when the caller asks.
+      if (count("error") > 0 || (values["fail-on-breaks"] && openBreaks > 0)) process.exitCode = 1;
+      break;
+    }
     case "action": {
       const type = need(b, "action type") as ActionInput["type"];
       const input: ActionInput = { type, recordTime: need(values.record, "--record"), exclude: list(values.exclude) };
