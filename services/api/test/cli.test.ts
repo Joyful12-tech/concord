@@ -61,10 +61,10 @@ function seed(): string {
       AT,
       `tx-${id}`,
     );
-  event(FUND, "fund-1", 1);
-  event(FUND, "fund-2", 2);
-  event(FUND, "fund-3", 3);
-  event(OTHER, "other-1", 4);
+  event(FUND, "1-1", 1);
+  event(FUND, "1-2", 2);
+  event(FUND, "1-3", 3);
+  event(OTHER, "1-4", 4);
 
   let registerId = 0;
   for (const [n, asOf] of [AT, "2026-01-03T00:00:00.000Z"].entries()) {
@@ -101,10 +101,10 @@ interface Run {
 }
 
 /** The CLI with no terminal on stdin, as a cron job or a script would run it. */
-function cli(dir: string, args: string[]): Run {
+function cli(dir: string, args: string[], env: Record<string, string> = {}): Run {
   const result = spawnSync(process.execPath, ["--import", "tsx", CLI, ...args], {
     cwd: API_DIR,
-    env: { ...process.env, CONCORD_DATA_DIR: dir, CONCORD_SYNC_INTERVAL: "0" },
+    env: { ...process.env, CONCORD_DATA_DIR: dir, CONCORD_SYNC_INTERVAL: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
     timeout: 60_000,
@@ -154,6 +154,118 @@ describe("unwatch needs confirmation", () => {
     expect(run.status).toBe(0);
     expect(run.stdout).toContain("stopped watching");
     expect(counts(dir)).toEqual({ assets: 1, events: 1, registers: 0, runs: 0, notes: 0 });
+  });
+});
+
+/** One register line the chain does not hold, so reconciling finds an open break. */
+function addRegisterBreak(dir: string): void {
+  const db = new Db(tenantPath(dir), ORG_MIGRATIONS);
+  const register = db.get<{ id: number }>(
+    "SELECT id FROM registers WHERE asset_id = ? ORDER BY as_of DESC, id DESC LIMIT 1",
+    FUND,
+  );
+  db.insert(
+    "INSERT INTO register_positions (register_id, holder_id, units) VALUES (?, 'holder-1', 50000000)",
+    register!.id,
+  );
+  db.close();
+}
+
+interface Summary {
+  network: string | null;
+  results: Array<{
+    asset: string;
+    code: string;
+    network: string;
+    status: string;
+    runId: number | null;
+    asOf: string | null;
+    openBreaks: number;
+    error: string | null;
+  }>;
+  totals: { assets: number; clean: number; breaks: number; failed: number; openBreaks: number };
+}
+
+function summary(run: Run): Summary {
+  return JSON.parse(run.stdout) as Summary;
+}
+
+describe("reconcile-all", () => {
+  // Point the testnet endpoints at a closed loopback port so a sync attempt fails at once
+  // instead of reaching for the real network.
+  const LOOPBACK = {
+    CONCORD_TESTNET_RPC_URLS: "http://127.0.0.1:1",
+    CONCORD_TESTNET_HORIZON_URLS: "http://127.0.0.1:1",
+  };
+
+  it("reconciles every asset with a register and skips the rest", () => {
+    const dir = seed();
+    addRegisterBreak(dir);
+    const run = cli(dir, ["reconcile-all", "--org", ORG_ID, "--json"], LOOPBACK);
+    expect(run.status).toBe(0);
+    const report = summary(run);
+    expect(report.results.map((r) => r.asset)).toEqual([FUND]);
+    expect(report.results[0]).toMatchObject({ status: "breaks", error: null });
+    expect(report.results[0]!.openBreaks).toBeGreaterThan(0);
+    expect(report.totals).toEqual({
+      assets: 1,
+      clean: 0,
+      breaks: 1,
+      failed: 0,
+      openBreaks: report.results[0]!.openBreaks,
+    });
+  });
+
+  it("only exits 1 on open breaks when --fail-on-breaks is given", () => {
+    const dir = seed();
+    addRegisterBreak(dir);
+    expect(cli(dir, ["reconcile-all", "--org", ORG_ID, "--json"], LOOPBACK).status).toBe(0);
+    expect(cli(dir, ["reconcile-all", "--org", ORG_ID, "--json", "--fail-on-breaks"], LOOPBACK).status).toBe(1);
+  });
+
+  it("continues past an asset that fails and reports its error", () => {
+    const dir = seed();
+    addRegisterBreak(dir);
+    // A position whose units cannot be read makes that asset's reconciliation throw.
+    const db = new Db(tenantPath(dir), ORG_MIGRATIONS);
+    const otherRegister = db.insert(
+      "INSERT INTO registers (asset_id, as_of, source, sha256, issues, imported_at) VALUES (?, ?, 'test', 'other-sha', '[]', ?)",
+      OTHER,
+      AT,
+      AT,
+    );
+    db.insert(
+      "INSERT INTO register_positions (register_id, holder_id, units) VALUES (?, 'holder-1', 'not-a-number')",
+      otherRegister,
+    );
+    db.close();
+
+    const run = cli(dir, ["reconcile-all", "--org", ORG_ID, "--json"], LOOPBACK);
+    expect(run.status).toBe(1);
+    const report = summary(run);
+    const failed = report.results.find((r) => r.asset === OTHER);
+    expect(failed).toMatchObject({ status: "error", openBreaks: 0 });
+    expect(failed!.error).toBeTruthy();
+    // The other asset still reconciled.
+    expect(report.results.find((r) => r.asset === FUND)).toMatchObject({ status: "breaks", error: null });
+    expect(report.totals).toMatchObject({ assets: 2, breaks: 1, failed: 1 });
+  });
+
+  it("limits the run with --network", () => {
+    const dir = seed();
+    const run = cli(dir, ["reconcile-all", "--org", ORG_ID, "--network", "mainnet", "--json"], LOOPBACK);
+    expect(run.status).toBe(0);
+    const report = summary(run);
+    expect(report.network).toBe("mainnet");
+    expect(report.results).toEqual([]);
+    expect(report.totals).toEqual({ assets: 0, clean: 0, breaks: 0, failed: 0, openBreaks: 0 });
+  });
+
+  it("rejects an unknown --network", () => {
+    const dir = seed();
+    const run = cli(dir, ["reconcile-all", "--org", ORG_ID, "--network", "futurenet"], LOOPBACK);
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain("mainnet or testnet");
   });
 });
 

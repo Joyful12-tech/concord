@@ -46,6 +46,10 @@ Everything to date; Concord's history begins 2026-10 with the commits below.
 
 ### Added
 
+- `concord reconcile-all` runs the latest reconciliation for every watched asset that has a
+  register in one command, continues past an asset that fails and prints one summary (table or
+  `--json`). It exits 1 when an asset failed, and with `--fail-on-breaks` also when any asset's
+  latest run leaves an open break; `--network` limits it to one network (#560).
 - CSV templates can include one illustrative example row with `?example=1` or `?example=true` (#200).
 - The accounting core (`feat(core)`, `c402eae`): holdings replay from CAP-67 events, position
   and movement reconciliation with typed breaks, corporate-action entitlements (dividend,
