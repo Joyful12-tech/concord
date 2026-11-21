@@ -20,6 +20,8 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   journal ASSET FILE               import the register's transaction journal
   instructions ASSET FILE          import control instructions
   reconcile ASSET [--register ID]  re-run a reconciliation
+  reconcile-all [--network N] [--fail-on-breaks]
+                                   reconcile every asset that has a register, one by one
   action ASSET dividend --record ISO --rate R [--pay-asset A] [--payer G...] [--until ISO]
   action ASSET split|redemption --record ISO --ratio NUM:DEN [--until ISO]
         [--label TEXT] [--exclude A,B]

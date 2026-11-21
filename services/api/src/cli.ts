@@ -41,6 +41,7 @@ async function main(): Promise<void> {
       out: { type: "string" },
       note: { type: "string" },
       json: { type: "boolean" },
+      "fail-on-breaks": { type: "boolean" },
       yes: { type: "boolean", short: "y" },
       "dry-run": { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -224,6 +225,38 @@ async function main(): Promise<void> {
     case "reconcile":
       printRun(await workspace().reconcile(need(a, "asset"), values.register ? Number(values.register) : undefined, actor));
       break;
+    case "reconcile-all": {
+      const concord = workspace();
+      if (values.network !== undefined && !isNetworkName(values.network)) {
+        throw new Error("--network must be mainnet or testnet");
+      }
+      // Only assets with a register can reconcile; the rest have nothing to compare against.
+      const targets = concord.assets(values.network).filter((asset) => concord.registers(asset.id).length > 0);
+      const rows: Array<{ asset: string; status: string; openBreaks: number | null; error: string | null }> = [];
+      for (const asset of targets) {
+        try {
+          const run = await concord.reconcile(asset.id, undefined, actor);
+          rows.push({ asset: asset.code, status: run.status, openBreaks: run.openBreaks, error: null });
+        } catch (err) {
+          // One asset's failure must not stop the rest of the run.
+          rows.push({ asset: asset.code, status: "error", openBreaks: null, error: (err as Error).message });
+        }
+      }
+      if (values.json) out(rows);
+      else {
+        table(rows);
+        const withBreaks = rows.filter((r) => (r.openBreaks ?? 0) > 0).length;
+        const failed = rows.filter((r) => r.error !== null).length;
+        console.log(`${rows.length} assets reconciled · ${withBreaks} with open breaks · ${failed} failed`);
+      }
+      if (
+        rows.some((r) => r.error !== null) ||
+        (values["fail-on-breaks"] && rows.some((r) => (r.openBreaks ?? 0) > 0))
+      ) {
+        process.exitCode = 1;
+      }
+      break;
+    }
     case "action": {
       const type = need(b, "action type") as ActionInput["type"];
       const input: ActionInput = { type, recordTime: need(values.record, "--record"), exclude: list(values.exclude) };
