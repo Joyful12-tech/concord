@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   buildControlsLog,
   dividendBreakdown,
@@ -168,6 +169,13 @@ interface StoredBreak {
   difference?: string | null;
 }
 
+interface Coverage {
+  from: string | null;
+  to: string | null;
+  mode: "baseline" | "ledger" | "window";
+  complete: boolean;
+}
+
 interface RunResult {
   registerId: number;
   registerSha256: string;
@@ -182,6 +190,7 @@ interface RunResult {
   lines: Array<Record<string, unknown>>;
   movement: Record<string, unknown> | null;
   breaks: StoredBreak[];
+  coverage: Coverage;
 }
 
 interface ActionFlowResult {
@@ -202,10 +211,67 @@ interface ActionResult {
   lines: Array<Record<string, unknown>>;
   breaks: StoredBreak[];
   cashInLieu?: ActionFlowResult;
+  coverage: Coverage;
 }
 
 const now = () => new Date().toISOString();
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** Version of the audit pack's shape (docs/audit-pack.schema.json); bump it on a breaking change. */
+export const AUDIT_PACK_SCHEMA_VERSION = 1;
+
+/**
+ * Serializes a value into RFC 8785 canonical JSON.
+ * - Object keys sorted lexicographically by UTF-16 code units
+ * - Primitives formatted according to ECMAScript standard JSON rules (-0 formatted as "0")
+ * - Whitespace stripped
+ * - undefined, functions, and symbols in objects omitted; in arrays rendered as null
+ */
+export function canonicalJson(value: unknown): string {
+  if (value && typeof (value as { toJSON?: unknown }).toJSON === "function") {
+    value = (value as { toJSON: () => unknown }).toJSON();
+  }
+  if (value === null || typeof value !== "object") {
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) return "null";
+      if (Object.is(value, -0)) return "0";
+      return JSON.stringify(value);
+    }
+    if (typeof value === "undefined" || typeof value === "function" || typeof value === "symbol") {
+      return undefined as unknown as string;
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    const items = value.map((v) => {
+      const s = canonicalJson(v);
+      return s === undefined ? "null" : s;
+    });
+    return `[${items.join(",")}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const entries: string[] = [];
+  for (const k of keys) {
+    const val = obj[k];
+    if (val === undefined || typeof val === "function" || typeof val === "symbol") continue;
+    const json = canonicalJson(val);
+    if (json !== undefined) {
+      entries.push(`${JSON.stringify(k)}:${json}`);
+    }
+  }
+  return `{${entries.join(",")}}`;
+}
+
+/**
+ * Computes the SHA-256 digest of an audit pack over RFC 8785 canonical JSON,
+ * excluding volatile/digest fields sha256 and generatedAt.
+ */
+export function auditPackDigest(pack: Record<string, unknown>): string {
+  // The signature fields are added after the digest is taken, so they are never part of it.
+  const { sha256: _sha256, generatedAt: _generatedAt, keyId: _keyId, signature: _signature, ...content } = pack;
+  return sha256(canonicalJson(content));
+}
 const MAX_REGISTER_CLOCK_SKEW_MS = 5 * 60_000;
 const DEFAULT_INSTRUCTION_WINDOW_HOURS = 72;
 const DEFAULT_MOVEMENT_WINDOW_HOURS = 24;
@@ -219,6 +285,60 @@ function windowHours(value: number | undefined, field: string, fallback: number)
   }
   return value;
 }
+
+/** Options for one page of `holdings()`. `after` is the last address of the previous page. */
+export interface HoldingsPage {
+  limit?: number;
+  offset?: number;
+  after?: string;
+  /** Address prefix; case does not matter. */
+  q?: string;
+  sort?: "units" | "address";
+}
+
+const DEFAULT_HOLDINGS_LIMIT = 100;
+const MAX_HOLDINGS_LIMIT = 1000;
+
+function holdingsPage(page: HoldingsPage): Required<Pick<HoldingsPage, "limit" | "offset" | "sort">> & Pick<HoldingsPage, "after" | "q"> {
+  const limit = page.limit ?? DEFAULT_HOLDINGS_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_HOLDINGS_LIMIT) {
+    throw new Invalid(`limit must be an integer between 1 and ${MAX_HOLDINGS_LIMIT}`);
+  }
+  const offset = page.offset ?? 0;
+  if (!Number.isInteger(offset) || offset < 0) throw new Invalid("offset must be a whole number");
+  if (page.after !== undefined && page.offset !== undefined) throw new Invalid("give offset or after, not both");
+  if (page.after !== undefined && !page.after) throw new Invalid("after must be an address");
+  const sort = page.sort ?? "units";
+  if (sort !== "units" && sort !== "address") throw new Invalid("sort must be units or address");
+  const q = page.q?.trim().toUpperCase();
+  return { limit, offset, sort, ...(page.after !== undefined ? { after: page.after } : {}), ...(q ? { q } : {}) };
+}
+
+/** What a destructive delete takes with it, so the CLI can show it before asking. */
+export interface DeletionCounts {
+  assets: number;
+  events: number;
+  registers: number;
+  runs: number;
+  notes: number;
+}
+
+export interface ConcordOptions {
+  checkpointEvery?: number;
+  /** ed25519 private key (PEM, or a path to one) that signs audit packs. */
+  signingKey?: string;
+  /** Assets of one network that `syncAll` indexes at once. 1 walks them in order. */
+  syncConcurrency?: number;
+  /**
+   * How long one asset may page through events in a `syncAll` pass before it yields; the rest of
+   * its backlog waits for the next pass. 0 means no limit.
+   */
+  syncAssetBudgetMs?: number;
+  /** Milliseconds clock, for tests. */
+  now?: () => number;
+}
+
+export type SyncResult = { added: number; more?: true };
 
 const HTML_ESCAPES: Record<string, string> = {
   "&": "&amp;",
@@ -469,25 +589,47 @@ function resume(
  * One workspace: every operation the API and the CLI expose over a single database.
  * Reads the chain, never writes it.
  */
+export const EVENT_COLUMNS = [
+  "id",
+  "ledger",
+  "closedAt",
+  "kind",
+  "from",
+  "to",
+  "units",
+  "authorized",
+  "txHash",
+] as const;
+
 export class Concord {
   private readonly syncing = new Map<string, Promise<{ added: number }>>();
   private readonly removing = new Set<string>();
   /** Current holdings per asset; replaying every event on each dashboard poll is too slow. */
   private readonly stateMemo = new Map<string, HoldingsState>();
   private seenVersion: number;
+  private readonly checkpointEvery: number;
+  private readonly syncConcurrency: number;
+  private readonly syncAssetBudgetMs: number;
+  private readonly clock: () => number;
   /** Outbound alerts. Replaced in tests so no delivery leaves the machine. */
   webhooks = new WebhookSender();
-  private readonly checkpointEvery: number;
 
   constructor(
     readonly db: Db,
     readonly networks: Networks,
-    options: { checkpointEvery?: number } = {},
+    readonly options: ConcordOptions = {},
   ) {
     this.seenVersion = db.dataVersion();
     const every = options.checkpointEvery ?? CHECKPOINT_EVERY;
     if (!Number.isSafeInteger(every) || every < 1) throw new Error("checkpointEvery must be a positive integer");
     this.checkpointEvery = every;
+    const concurrency = options.syncConcurrency ?? 1;
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error("syncConcurrency must be a positive integer");
+    this.syncConcurrency = concurrency;
+    const budget = options.syncAssetBudgetMs ?? 0;
+    if (!Number.isFinite(budget) || budget < 0) throw new Error("syncAssetBudgetMs must be zero or more");
+    this.syncAssetBudgetMs = budget;
+    this.clock = options.now ?? Date.now;
   }
 
   /** Forget cached holdings for an asset this instance just changed. */
@@ -507,12 +649,19 @@ export class Concord {
     else this.db.write("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", key, value);
   }
 
-  /** The workspace's outbound webhook, including the secret a receiver checks signatures with. */
+  /**
+   * The workspace's outbound webhook, including the secret a receiver checks signatures with.
+   * Only a workspace owner is shown this by the API.
+   */
   webhookSettings(): { url: string | null; secret: string | null } {
     return { url: this.setting("webhook_url") ?? null, secret: this.setting("webhook_secret") ?? null };
   }
 
-  /** Point alerts at an https endpoint, or clear them with an empty value. */
+  /**
+   * Point alerts at an https endpoint, or clear them with an empty value. The signing secret is
+   * made once and kept across edits, so a receiver does not have to re-key on every change.
+   * `base` is the dashboard origin the payload's link is built from.
+   */
   setWebhook(rawUrl: unknown, base?: string): { url: string | null; secret: string | null } {
     const text = typeof rawUrl === "string" ? rawUrl.trim() : "";
     if (!text) {
@@ -532,7 +681,10 @@ export class Concord {
     return this.webhookSettings();
   }
 
-  /** Queue an alert without waiting for delivery or allowing delivery errors to escape. */
+  /**
+   * Queue one alert. Deliberately not awaited and never throwing: a slow or broken endpoint must
+   * not hold up indexing or a reconciliation. The sender logs its own failures.
+   */
   private alert(type: WebhookEventType, asset: AssetRecord, count: number, path: string): void {
     const url = this.setting("webhook_url");
     const secret = this.setting("webhook_secret");
@@ -836,42 +988,54 @@ export class Concord {
 
   // ── indexer ───────────────────────────────────────────────────────────────
 
-  /** Pull new events for one asset. Concurrent calls share one pass. */
-  sync(ref: string, head?: ChainHead): Promise<{ added: number }> {
+  /**
+   * Pull new events for one asset. Concurrent calls share one pass. With `budgetMs` the pass
+   * stops paging once that long has gone by, saves its position and reports `more`.
+   */
+  sync(ref: string, head?: ChainHead, options: { budgetMs?: number } = {}): Promise<SyncResult> {
     const asset = this.asset(ref);
     if (this.removing.has(asset.id)) throw new NotFound(`asset ${ref} is not watched`);
     const running = this.syncing.get(asset.id);
     if (running) return running;
-    const pass = this.runSync(asset, head).finally(() => this.syncing.delete(asset.id));
+    const deadline = options.budgetMs ? this.clock() + options.budgetMs : undefined;
+    const pass = this.runSync(asset, head, deadline).finally(() => this.syncing.delete(asset.id));
     this.syncing.set(asset.id, pass);
     return pass;
   }
 
   /**
    * One pass over every asset. Networks run side by side, so an outage on one cannot stall the
-   * other. Keyed by asset id.
+   * other. Within a network up to `syncConcurrency` assets index at once, taken in order, and
+   * each may page for at most `syncAssetBudgetMs` before yielding to the next pass; one asset
+   * with a long backlog therefore cannot hold the rest. Keyed by asset id.
    */
-  async syncAll(): Promise<Record<string, { added: number } | { error: string }>> {
-    const out: Record<string, { added: number } | { error: string }> = {};
+  async syncAll(): Promise<Record<string, SyncResult | { error: string }>> {
+    const out: Record<string, SyncResult | { error: string }> = {};
+    const budget = this.syncAssetBudgetMs > 0 ? { budgetMs: this.syncAssetBudgetMs } : {};
     await Promise.all(
       this.networkNames().map(async (network) => {
         const assets = this.assets(network);
         if (assets.length === 0) return;
         // One look at the chain's range serves every asset on the network.
         const head = await this.networks[network]?.chain?.latestLedger().catch(() => undefined);
-        for (const asset of assets) {
-          try {
-            out[asset.id] = await this.sync(asset.id, head);
-          } catch (err) {
-            out[asset.id] = { error: describeFailure(err) };
+        let next = 0;
+        const worker = async () => {
+          while (next < assets.length) {
+            const asset = assets[next++]!;
+            try {
+              out[asset.id] = await this.sync(asset.id, head, budget);
+            } catch (err) {
+              out[asset.id] = { error: describeFailure(err) };
+            }
           }
-        }
+        };
+        await Promise.all(Array.from({ length: Math.min(this.syncConcurrency, assets.length) }, worker));
       }),
     );
     return out;
   }
 
-  private async runSync(asset: AssetRecord, head?: ChainHead): Promise<{ added: number }> {
+  private async runSync(asset: AssetRecord, head?: ChainHead, deadline?: number): Promise<SyncResult> {
     try {
       const chain = this.requireChain(asset.network);
       head ??= await chain.latestLedger();
@@ -898,27 +1062,31 @@ export class Concord {
           );
         }
       }
-      const out = await this.syncPass(ready, chain);
+      const out = await this.syncPass(ready, chain, deadline);
       if (this.removing.has(asset.id)) return { added: 0 };
       if (asset.syncError) {
         this.db.write("UPDATE assets SET sync_error = NULL, sync_error_at = NULL WHERE id = ?", asset.id);
       }
       return out;
     } catch (err) {
-      const failure = describeFailure(err);
       if (this.removing.has(asset.id)) throw err;
+      const failure = describeFailure(err);
       this.db.write(
         "UPDATE assets SET sync_error = ?, sync_error_at = ? WHERE id = ?",
         failure,
         now(),
         asset.id,
       );
-      if (asset.syncError !== failure) this.alert("sync.failed", asset, 1, `/#/a/${asset.id}`);
+      // A pass that fails every 30 seconds must not alert every 30 seconds; only a new or changed
+      // failure is news.
+      if (asset.syncError !== failure) {
+        this.alert("sync.failed", asset, 1, `/#/a/${asset.id}`);
+      }
       throw err;
     }
   }
 
-  private async syncPass(asset: AssetRecord, chain: ChainSource): Promise<{ added: number }> {
+  private async syncPass(asset: AssetRecord, chain: ChainSource, deadline?: number): Promise<SyncResult> {
     if (asset.startLedger === undefined) throw new Invalid("this asset has no starting ledger yet");
     const limit = 1000;
     let from: { startLedger: number } | { cursor: string } = asset.cursor
@@ -966,6 +1134,8 @@ export class Concord {
         this.touch(asset.id);
       }
       if (atTip || !cursor) break;
+      // Out of time: the cursor is saved, so the next pass carries on from here.
+      if (deadline !== undefined && this.clock() >= deadline) return { added, more: true };
       from = { cursor };
     }
     return { added };
@@ -1113,13 +1283,66 @@ export class Concord {
     });
   }
 
-  holdings(ref: string, asOf?: string) {
+  /**
+   * Holders of an asset at a moment. Without `page` every holder is returned (exports rely on
+   * this). With `page` the list is filtered, sorted and cut to one page; `supply` and
+   * `holderCount` always describe the whole asset, and `matched` counts holders matching `q`.
+   * Every sort ends on the address, so the order is total and pages are stable across calls.
+   */
+  /**
+   * The rows that deleting one asset, or the whole workspace, would remove. Counted from the same
+   * tables the deletes cascade through, so an operator sees the size of the loss first.
+   */
+  deletionCounts(ref?: string): DeletionCounts {
+    const asset = ref ? this.asset(ref) : undefined;
+    const args: string[] = asset ? [asset.id] : [];
+    // The assets table keys on `id`; everything else that belongs to an asset keys on `asset_id`.
+    const count = (table: string, column = "asset_id"): number =>
+      Number(
+        this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}${asset ? ` WHERE ${column} = ?` : ""}`, ...args)
+          ?.n ?? 0,
+      );
+    return {
+      assets: asset ? 1 : count("assets", "id"),
+      events: count("events"),
+      registers: count("registers"),
+      runs: count("runs"),
+      notes: count("break_notes"),
+    };
+  }
+
+  holdings(ref: string, asOf?: string, page?: HoldingsPage) {
     const asset = this.asset(ref);
     const upTo = asOf ? isoTime(asOf, "asOf") : undefined;
+    const paging = page ? holdingsPage(page) : undefined;
     const state = this.state(asset, upTo);
     const ignored = new Set(asset.ignore);
-    const holders = [...state.balances]
-      .sort((a, b) => (a[1] === b[1] ? a[0].localeCompare(b[0]) : a[1] > b[1] ? -1 : 1))
+    let rows = [...state.balances].sort(
+      paging?.sort === "address"
+        ? (a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)
+        : (a, b) => (a[1] === b[1] ? (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0) : a[1] > b[1] ? -1 : 1),
+    );
+    const holderCount = rows.length;
+    let pageInfo: { matched: number; offset: number; limit: number; next: string | null } | undefined;
+    if (paging) {
+      if (paging.q) rows = rows.filter(([address]) => address.startsWith(paging.q!));
+      const matched = rows.length;
+      let offset = paging.offset;
+      if (paging.after !== undefined) {
+        const after = paging.after;
+        const at = rows.findIndex(([address]) => address === after);
+        if (at >= 0) offset = at + 1;
+        else if (paging.sort === "address") {
+          // The holder may have left since the last page; resume at the next address instead.
+          const next = rows.findIndex(([address]) => address > after);
+          offset = next < 0 ? rows.length : next;
+        } else throw new Invalid("after must name a holder on this list; it may have sold out, so start again");
+      }
+      rows = rows.slice(offset, offset + paging.limit);
+      const end = offset + rows.length;
+      pageInfo = { matched, offset, limit: paging.limit, next: end < matched && rows.length > 0 ? rows[rows.length - 1]![0] : null };
+    }
+    const holders = rows
       .map(([address, units]) => ({
         address,
         units: formatUnits(units, asset.decimals),
@@ -1140,10 +1363,11 @@ export class Concord {
       asOf: upTo ?? asset.syncedAt ?? null,
       ledger: state.ledger,
       supply: formatUnits(state.supply, asset.decimals),
-      holderCount: holders.length,
+      holderCount,
       incomplete: state.incomplete,
       beforeHistory,
       warnings,
+      ...(pageInfo ? { page: pageInfo } : {}),
       holders,
     };
   }
@@ -1512,6 +1736,13 @@ export class Concord {
       });
   }
 
+  /** Remove a single journal entry by its ref. */
+  deleteJournalEntry(ref: string, entryRef: string): void {
+    const asset = this.asset(ref);
+    const removed = this.db.write("DELETE FROM journal WHERE asset_id = ? AND ref = ?", asset.id, entryRef);
+    if (removed === 0) throw new NotFound(`no such journal entry ${entryRef} for this asset`);
+  }
+
   importInstructions(ref: string, csv: string, options: { mode?: "merge" | "replace" } = {}) {
     const mode = options.mode ?? "merge";
     if (mode !== "merge" && mode !== "replace") {
@@ -1595,6 +1826,13 @@ export class Concord {
         approvedBy: r.approved_by ? String(r.approved_by) : null,
         reason: r.reason ? String(r.reason) : null,
       }));
+  }
+
+  /** Remove a single instruction by its ref. */
+  deleteInstruction(ref: string, instructionRef: string): void {
+    const asset = this.asset(ref);
+    const removed = this.db.write("DELETE FROM instructions WHERE asset_id = ? AND ref = ?", asset.id, instructionRef);
+    if (removed === 0) throw new NotFound(`no such instruction ${instructionRef} for this asset`);
   }
 
   // ── reconciliation ────────────────────────────────────────────────────────
@@ -1699,6 +1937,7 @@ export class Concord {
     for (const b of breaks) b.firstSeen = priorSeen.get(b.key) ?? asOf;
 
     const s = positions.summary;
+    const coverage = this.coverage(asset, asOf);
     const result: RunResult = {
       registerId: Number(reg.id),
       registerSha256: String(reg.sha256),
@@ -1733,17 +1972,26 @@ export class Concord {
       })),
       movement,
       breaks,
+      coverage,
     };
+    const openBreaks = this.annotate(asset.id, "recon", breaks).filter((b) => b.status === "open").length;
     const id = this.db.insert(
-      "INSERT INTO runs (asset_id, register_id, as_of, created_by, created_at, result) VALUES (?, ?, ?, ?, ?, ?)",
+      `INSERT INTO runs (asset_id, register_id, as_of, created_by, created_at, summary, status, chain_behind, open_breaks, result)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       asset.id,
       Number(reg.id),
       asOf,
       actor?.label ?? null,
       now(),
+      JSON.stringify(result.summary),
+      result.status,
+      chainBehind ? 1 : 0,
+      openBreaks,
       JSON.stringify(result),
     );
-    if (breaks.length > 0) this.alert("run.breaks", asset, breaks.length, `/#/a/${asset.id}/reconciliation`);
+    if (breaks.length > 0) {
+      this.alert("run.breaks", asset, breaks.length, `/#/a/${asset.id}/reconciliation`);
+    }
     return this.run(id);
   }
 
@@ -1927,22 +2175,35 @@ ul { margin: 6px 0 0; padding-left: 20px; }
 `;
   }
 
+  /**
+   * The last 200 reconciliations as summaries. Everything comes from columns so that listing
+   * never parses a stored result body, which for a thousand-holder register is hundreds of KB.
+   */
   runs(ref: string) {
     const asset = this.asset(ref);
     return this.db
-      .all<{ id: number }>("SELECT id FROM runs WHERE asset_id = ? ORDER BY id DESC LIMIT 200", asset.id)
-      .map(({ id }) => {
-        const r = this.run(id);
-        return {
-          id: r.id,
-          asOf: r.asOf,
-          createdAt: r.createdAt,
-          status: r.status,
-          chainBehind: r.chainBehind,
-          summary: r.summary,
-          openBreaks: r.openBreaks,
-        };
-      });
+      .all<{
+        id: number;
+        as_of: string;
+        created_at: string;
+        status: string;
+        chain_behind: number;
+        summary: string;
+        open_breaks: number;
+      }>(
+        `SELECT id, as_of, created_at, status, chain_behind, summary, open_breaks
+         FROM runs WHERE asset_id = ? ORDER BY id DESC LIMIT 200`,
+        asset.id,
+      )
+      .map((r) => ({
+        id: Number(r.id),
+        asOf: String(r.as_of),
+        createdAt: String(r.created_at),
+        status: String(r.status) as RunResult["status"],
+        chainBehind: Number(r.chain_behind) === 1,
+        summary: JSON.parse(String(r.summary)) as RunResult["summary"],
+        openBreaks: Number(r.open_breaks),
+      }));
   }
 
   /**
@@ -2014,6 +2275,22 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     for (const n of this.db.all("SELECT * FROM break_notes WHERE asset_id = ? AND scope = ?", assetId, scope)) {
       notes.set(String(n.key), n);
     }
+    const histories = new Map<string, Array<{ status: string; note: string; author: string | null; at: string }>>();
+    for (const h of this.db.all(
+      "SELECT key, status, note, author, at FROM break_note_history WHERE asset_id = ? AND scope = ? ORDER BY id ASC",
+      assetId,
+      scope,
+    )) {
+      const k = String(h.key);
+      const list = histories.get(k) ?? [];
+      list.push({
+        status: String(h.status),
+        note: String(h.note),
+        author: h.author ? String(h.author) : null,
+        at: String(h.at),
+      });
+      histories.set(k, list);
+    }
     return breaks.map((b) => {
       const n = notes.get(b.key);
       const current = n !== undefined && String(n.fingerprint) === b.fingerprint;
@@ -2025,6 +2302,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         noteAuthor: n?.author ? String(n.author) : null,
         noteAt: n ? String(n.updated_at) : null,
         noteStale: n !== undefined && !current,
+        history: histories.get(b.key) ?? [],
       };
     });
   }
@@ -2087,8 +2365,31 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         actor?.id ?? null,
         at,
       );
+      // A sign-off moves a break out of the open count the runs list reads from a column.
+      if (scope === "recon") this.countOpenBreaks(asset.id);
     });
     return { ok: true };
+  }
+
+  /**
+   * Rewrite the stored open-break count for every reconciliation of an asset, applying the same
+   * overlay as `annotate`. This is the only listing-adjacent path that reads result bodies, and it
+   * runs on a sign-off rather than on every list request.
+   */
+  private countOpenBreaks(assetId: string): void {
+    this.db.write(
+      `UPDATE runs SET open_breaks = (
+         SELECT COUNT(*) FROM json_each(runs.result, '$.breaks') b
+         WHERE NOT EXISTS (
+           SELECT 1 FROM break_notes n
+           WHERE n.asset_id = runs.asset_id AND n.scope = 'recon'
+             AND n.key = json_extract(b.value, '$.key')
+             AND n.fingerprint = json_extract(b.value, '$.fingerprint')
+             AND n.status <> 'open'
+         )
+       ) WHERE asset_id = ?`,
+      assetId,
+    );
   }
 
   /** Every sign-off change for one break, oldest first: who, when, what status, and the note. */
@@ -2110,6 +2411,12 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         author: r.author ? String(r.author) : null,
         at: String(r.at),
       }));
+  }
+
+  /** Sign-off history for one break, oldest first: who, when, what status, and the note. */
+  breakHistory(ref: string, scope: string, key: string) {
+    if (!scope || !key) throw new Invalid("scope and key are required");
+    return this.noteHistory(ref, scope, key).map(({ status, note, author, at }) => ({ status, note, author, at }));
   }
 
   // ── corporate actions ─────────────────────────────────────────────────────
@@ -2226,6 +2533,21 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     return first?.closed_at;
   }
 
+  /**
+   * The instant range the asset's indexed history can be trusted for, and whether `instant` is
+   * inside it. A baseline asset with no events yet is covered from when it was watched.
+   */
+  private coverage(asset: AssetRecord, instant: string): Coverage {
+    const from = this.historyStart(asset) ?? (asset.startMode === "baseline" ? asset.createdAt : null);
+    const to = asset.syncedAt ?? null;
+    return {
+      from,
+      to,
+      mode: asset.startMode,
+      complete: to !== null && instant <= to && (from === null || instant >= from),
+    };
+  }
+
   /** Freeze the record-date holdings once the indexed chain has passed the record time. */
   private snapshot(asset: AssetRecord, row: Row): HoldingsState | undefined {
     if (row.snapshot) {
@@ -2253,6 +2575,8 @@ ul { margin: 6px 0 0; padding-left: 20px; }
   async reconcileAction(id: number, options: { sync?: boolean } = {}) {
     const row = this.db.get("SELECT * FROM actions WHERE id = ?", id);
     if (!row) throw new NotFound(`corporate action ${id} not found`);
+    // A voided action is history: it is never read from the chain or reconciled again.
+    if (row.voided_at) return this.action(id);
     const params = JSON.parse(String(row.params)) as Record<string, unknown>;
     const type = String(row.type) as ActionType;
     const warnings: string[] = [];
@@ -2289,6 +2613,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         summary: { holders: 0, expectedTotal: "0", observedTotal: "0", difference: "0", breakCount: 0 },
         lines: [],
         breaks: [],
+        coverage: this.coverage(asset, recordTime),
       };
       this.db.write("UPDATE actions SET result = ?, reconciled_at = ? WHERE id = ?", JSON.stringify(result), now(), id);
       return this.action(id);
@@ -2436,6 +2761,13 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     const allBreaks = cashFlowResult ? [...unitBreaks, ...cashFlowResult.breaks] : unitBreaks;
     const isClean = recon.breaks.length === 0 && (!cashFlowResult || cashFlowResult.breaks.length === 0);
 
+    const chainBehind = !asset.syncedAt || asset.syncedAt < recordTime;
+    const coverage = this.coverage(asset, recordTime);
+    if (chainBehind) {
+      warnings.push(
+        `Chain is indexed to ${asset.syncedAt ?? "nothing"}, before the action's record time; later activity is not reflected`,
+      );
+    }
     const result: ActionResult = {
       reconciledThrough: flowAsset.syncedAt ?? null,
       warnings,
@@ -2469,9 +2801,12 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       }),
       breaks: allBreaks,
       ...(cashFlowResult ? { cashInLieu: cashFlowResult } : {}),
+      coverage,
     };
     this.db.write("UPDATE actions SET result = ?, reconciled_at = ? WHERE id = ?", JSON.stringify(result), now(), id);
-    if (result.breaks.length > 0) this.alert("action.breaks", asset, result.breaks.length, `/#/a/${asset.id}/actions`);
+    if (result.breaks.length > 0) {
+      this.alert("action.breaks", asset, result.breaks.length, `/#/a/${asset.id}/actions`);
+    }
     return this.action(id);
   }
 
@@ -2484,6 +2819,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       : null;
     const result = row.result ? (JSON.parse(String(row.result)) as ActionResult) : null;
     const breaks = result ? this.annotate(asset.id, `action:${id}`, result.breaks) : [];
+    const voidedAt = row.voided_at ? String(row.voided_at) : null;
     return {
       id: Number(row.id),
       assetId: asset.id,
@@ -2493,7 +2829,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       params: JSON.parse(String(row.params)) as Record<string, unknown>,
       createdAt: String(row.created_at),
       reconciledAt: row.reconciled_at ? String(row.reconciled_at) : null,
-      state: snapshot ? (result?.status ?? "pending") : "scheduled",
+      state: voidedAt ? "voided" : snapshot ? (result?.status ?? "pending") : "scheduled",
       snapshot: snapshot && {
         ledger: snapshot.ledger,
         takenAt: snapshot.takenAt,
@@ -2504,7 +2840,11 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         })),
       },
       result: result && { ...result, breaks },
-      openBreaks: breaks.filter((b) => b.status === "open").length,
+      // The breaks stay on the record for the audit trail, but a voided action is not open.
+      openBreaks: voidedAt ? 0 : breaks.filter((b) => b.status === "open").length,
+      voidedAt,
+      voidedBy: row.voided_by ? String(row.voided_by) : null,
+      voidReason: row.void_reason ? String(row.void_reason) : null,
     };
   }
 
@@ -2516,20 +2856,47 @@ ul { margin: 6px 0 0; padding-left: 20px; }
   }
 
   /**
+   * Cancel an action entered in error, keeping it in the audit trail. Nothing is deleted: the
+   * record keeps its snapshot, its result and its breaks, gains who voided it and why, and stops
+   * counting as open from then on.
+   */
+  async voidAction(id: number, reason: string, actor?: Actor): Promise<Awaited<ReturnType<typeof this.action>>> {
+    const row = this.db.get("SELECT * FROM actions WHERE id = ?", id);
+    if (!row) throw new NotFound(`corporate action ${id} not found`);
+    if (typeof reason !== "string" || !reason.trim()) {
+      throw new Invalid("a reason is required to void a corporate action");
+    }
+    const text = reason.trim();
+    if (text.length > 4000) throw new Invalid("reason is too long");
+    if (row.voided_at) throw new Invalid(`corporate action ${id} is already voided`);
+    this.db.write(
+      "UPDATE actions SET voided_at = ?, voided_by = ?, void_reason = ? WHERE id = ?",
+      now(),
+      actor?.label ?? null,
+      text,
+      id,
+    );
+    return this.action(id);
+  }
+
+
+  /**
    * Reconcile the corporate actions whose record time the indexed chain has now passed, and
    * re-run the ones already reconciled whose execution window is still open and whose flow asset
    * has been read further since. Run after a sync, so a scheduled action advances, and a late
-   * payment lands in the stored result, without anyone pressing a button.
+   * payment lands in the stored result, without anyone pressing a button. A voided action is
+   * never due.
    */
   async reconcileDue(): Promise<number> {
     const due = this.db
       .all<{ id: number }>(
         `SELECT a.id FROM actions a JOIN assets s ON s.id = a.asset_id
-         WHERE a.snapshot IS NULL AND s.synced_at IS NOT NULL AND s.synced_at >= a.record_time`,
+         WHERE a.snapshot IS NULL AND s.synced_at IS NOT NULL AND s.synced_at >= a.record_time
+           AND a.voided_at IS NULL`,
       )
       .map(({ id }) => id);
-    const reconciled = this.db.all<{ id: number; params: string; result: string }>(
-      "SELECT id, params, result FROM actions WHERE snapshot IS NOT NULL AND result IS NOT NULL",
+    const reconciled = this.db.all<{ id: number; params: string; result: string; voided_at: string | null }>(
+      "SELECT id, params, result, voided_at FROM actions WHERE snapshot IS NOT NULL AND result IS NOT NULL AND voided_at IS NULL",
     );
     for (const row of reconciled) {
       const result = JSON.parse(row.result) as ActionResult;
@@ -2710,8 +3077,20 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     };
   }
 
+  /**
+   * Returns the voided-flag for breakdowns that read the live result rather than the summary object.
+   * A voided action still carries its breaks in the trail, but they must not read as open anywhere.
+   */
+  isVoided(row: Row): boolean {
+    return row.voided_at !== null && row.voided_at !== undefined;
+  }
+
   /** Everything an auditor needs for a period, with a digest over the content. */
-  auditExport(ref: string, period: { from?: string; to?: string } = {}) {
+  auditExport(
+    ref: string,
+    period: { from?: string; to?: string } = {},
+    options: { signingKey?: string } = {},
+  ) {
     const asset = this.asset(ref);
     const to = period.to ? isoTime(period.to, "to") : (asset.syncedAt ?? now());
     const from = period.from ? isoTime(period.from, "from") : "1970-01-01T00:00:00.000Z";
@@ -2750,22 +3129,34 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       })(),
       registers,
       reconciliations: runs,
+      // A voided action stays in the pack. The pack's shape is a closed contract, so the void
+      // trail travels in the action's free-form params rather than as new top-level fields.
       corporateActions: this.actions(asset.id)
         .filter((a) => inPeriod(a.recordTime))
-        .map(({ result, ...rest }) => ({
-          ...rest,
-          result: result
-            ? {
-                reconciledThrough: result.reconciledThrough,
-                warnings: result.warnings,
-                status: result.status,
-                flowAsset: result.flowAsset,
-                summary: result.summary,
-                lines: result.lines,
-                breaks: result.breaks,
-              }
-            : null,
-        })),
+        .map(({ result, voidedAt, voidedBy, voidReason, ...rest }) => {
+          const action = {
+            ...rest,
+            result: result
+              ? {
+                  reconciledThrough: result.reconciledThrough,
+                  warnings: result.warnings,
+                  status: result.status,
+                  flowAsset: result.flowAsset,
+                  summary: result.summary,
+                  lines: result.lines,
+                  breaks: result.breaks,
+                  coverage: result.coverage,
+                }
+              : null,
+          };
+          return voidedAt === null
+            ? action
+            : {
+                ...action,
+                state: result?.status ?? (rest.snapshot ? "pending" : "scheduled"),
+                params: { ...rest.params, voided: { at: voidedAt, by: voidedBy, reason: voidReason } },
+              };
+        }),
       controls,
       // The whole trail, not the period: sign-offs happen in wall-clock time, not chain time.
       signoffHistory: this.noteHistory(asset.id),
@@ -2773,7 +3164,73 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         .filter((e) => inPeriod(e.closedAt))
         .map((e) => this.eventJson(e, asset.decimals)),
     };
-    return { generatedAt: now(), generator: "concord/0.1.0", sha256: sha256(JSON.stringify(content)), ...content };
+    const digest = auditPackDigest({ schemaVersion: AUDIT_PACK_SCHEMA_VERSION, generator: "concord/0.1.0", ...content });
+    const signingKey = options.signingKey ?? this.options.signingKey ?? process.env.CONCORD_SIGNING_KEY;
+    let signature: string | undefined;
+    let keyId: string | undefined;
+    if (signingKey) {
+      const pem = signingKey.includes("-----BEGIN") ? signingKey : readFileSync(signingKey, "utf8");
+      const priv = createPrivateKey(pem);
+      if (priv.asymmetricKeyType !== "ed25519") {
+        throw new Invalid("signing key must be an ed25519 private key");
+      }
+      const pub = createPublicKey(priv);
+      keyId = createHash("sha256").update(pub.export({ type: "spki", format: "der" })).digest("hex");
+      signature = sign(null, Buffer.from(digest), priv).toString("base64");
+    }
+    return {
+      schemaVersion: AUDIT_PACK_SCHEMA_VERSION,
+      generatedAt: now(),
+      generator: "concord/0.1.0",
+      sha256: digest,
+      ...(signature ? { keyId, signature } : {}),
+      ...content,
+    };
+  }
+
+  /**
+   * Stream events for an asset over a period as CSV or NDJSON lines one by one.
+   * Yields formatted strings with line breaks. Does not materialize all events in memory.
+   * Peak memory growth remains bounded under 50 MB even for 200,000+ events.
+   */
+  *exportEvents(
+    ref: string,
+    period: { from?: string; to?: string; format?: "csv" | "ndjson" } = {},
+    formatOrOptions?: "csv" | "ndjson" | { format?: "csv" | "ndjson" },
+  ): Generator<string, void, undefined> {
+    const format =
+      (typeof formatOrOptions === "string"
+        ? formatOrOptions
+        : formatOrOptions?.format ?? period.format) ?? "csv";
+    if (format !== "csv" && format !== "ndjson") {
+      throw new Invalid("format must be csv or ndjson");
+    }
+    const asset = this.asset(ref);
+    const to = period.to ? isoTime(period.to, "to") : (asset.syncedAt ?? now());
+    const from = period.from ? isoTime(period.from, "from") : "1970-01-01T00:00:00.000Z";
+    if (from > to) throw new Invalid("from must not be after to");
+
+    const header = format === "csv" ? toCsv([...EVENT_COLUMNS], []) : "";
+    if (format === "csv") {
+      yield header;
+    }
+
+    const stmt = this.db.raw.prepare(
+      "SELECT * FROM events WHERE asset_id = ? AND closed_at >= ? AND closed_at <= ? ORDER BY id",
+    );
+    const iter = stmt.iterate(asset.id, from, to);
+    try {
+      for (const row of iter) {
+        const ev = this.eventJson(toEvent(row as Row), asset.decimals);
+        if (format === "csv") {
+          yield toCsv([...EVENT_COLUMNS], [ev]).slice(header.length);
+        } else {
+          yield JSON.stringify(ev) + "\n";
+        }
+      }
+    } finally {
+      iter.return?.();
+    }
   }
 
   /** One section of the audit pack, or one corporate action's entitlement table, as CSV. */
@@ -2817,7 +3274,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       case "holdings":
         return toCsv(["address", "units", "share", "status", "ignored"], pack.holdings.holders);
       case "events":
-        return toCsv(["id", "ledger", "closedAt", "kind", "from", "to", "units", "authorized", "txHash"], pack.events);
+        return toCsv([...EVENT_COLUMNS], pack.events);
       case "controls":
         return toCsv(
           ["closedAt", "ledger", "type", "account", "units", "txHash", "instructionRef", "approvedBy", "reason"],
@@ -2834,7 +3291,10 @@ ul { margin: 6px 0 0; padding-left: 20px; }
           for (const b of run.breaks) rows.push({ source: `reconciliation ${run.id}`, asOf: run.asOf, ...b });
         }
         for (const a of pack.corporateActions) {
-          for (const b of a.result?.breaks ?? []) rows.push({ source: `${a.type} ${a.id}`, asOf: a.recordTime, ...b });
+          // A voided action is in the trail, but its breaks are not open. The pack's shape is
+          // closed, so a void travels in params rather than as a state of its own.
+          const breaks = a.params.voided ? [] : a.result?.breaks ?? [];
+          for (const b of breaks) rows.push({ source: `${a.type} ${a.id}`, asOf: a.recordTime, ...b });
         }
         for (const b of pack.controls.breaks) rows.push({ source: "controls", asOf: pack.period.to, ...b });
         return toCsv(
@@ -2857,8 +3317,12 @@ ul { margin: 6px 0 0; padding-left: 20px; }
             "status",
             "note",
             "noteAuthor",
+            "history",
           ],
-          rows,
+          rows.map((r) => ({
+            ...r,
+            history: Array.isArray(r.history) && r.history.length > 0 ? JSON.stringify(r.history) : "",
+          })),
         );
       }
       case "positions": {
@@ -2984,4 +3448,71 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         throw new Invalid(EXPORT_CSV_SECTION_ERROR);
     }
   }
+}
+
+export interface VerifyPackResult {
+  digestValid: boolean;
+  digest: string;
+  expectedDigest: string;
+  signed: boolean;
+  keyId: string | null;
+  signatureChecked: boolean;
+  signatureValid?: boolean;
+  error?: string;
+}
+
+export function verifyPack(pack: unknown, publicKeyPemOrPath?: string): VerifyPackResult {
+  if (!pack || typeof pack !== "object") {
+    throw new Invalid("audit pack must be a JSON object");
+  }
+  const p = pack as Record<string, unknown>;
+  const { sha256: packSha256, keyId, signature } = p;
+  if (typeof packSha256 !== "string") {
+    throw new Invalid("audit pack is missing sha256 digest");
+  }
+  const expectedDigest = auditPackDigest(p);
+  const digestValid = packSha256 === expectedDigest;
+  const signed = typeof signature === "string";
+
+  let signatureChecked = false;
+  let signatureValid: boolean | undefined = undefined;
+  let error: string | undefined = undefined;
+
+  if (publicKeyPemOrPath) {
+    signatureChecked = true;
+    if (!signed) {
+      signatureValid = false;
+      error = "pack is not signed";
+    } else {
+      try {
+        const pem = publicKeyPemOrPath.includes("-----BEGIN") ? publicKeyPemOrPath : readFileSync(publicKeyPemOrPath, "utf8");
+        const pub = createPublicKey(pem);
+        if (pub.asymmetricKeyType !== "ed25519") {
+          throw new Invalid("public key must be an ed25519 public key");
+        }
+        const computedKeyId = createHash("sha256").update(pub.export({ type: "spki", format: "der" })).digest("hex");
+        if (typeof keyId === "string" && keyId !== computedKeyId) {
+          signatureValid = false;
+          error = `keyId mismatch (pack: ${keyId}, public key: ${computedKeyId})`;
+        } else {
+          signatureValid = verify(null, Buffer.from(packSha256), pub, Buffer.from(signature as string, "base64"));
+          if (!signatureValid) error = "invalid signature";
+        }
+      } catch (err) {
+        signatureValid = false;
+        error = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
+
+  return {
+    digestValid,
+    digest: packSha256,
+    expectedDigest,
+    signed,
+    keyId: typeof keyId === "string" ? keyId : null,
+    signatureChecked,
+    signatureValid,
+    ...(error ? { error } : {}),
+  };
 }

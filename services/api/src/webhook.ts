@@ -1,6 +1,8 @@
 import { createHmac, randomBytes } from "node:crypto";
+import { lookup as lookupCallback, type LookupAddress } from "node:dns";
 import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { request } from "node:https";
+import { isIP, type LookupFunction } from "node:net";
 import { setTimeout as pauseFor } from "node:timers/promises";
 
 /** What a workspace can be told about: something a team must act on, not a progress tick. */
@@ -27,8 +29,9 @@ export function sign(secret: string, body: string): string {
 // ── SSRF guard ──────────────────────────────────────────────────────────────
 // A delivery is an outbound request that a workspace chooses. It must never reach the service's
 // own network, a cloud metadata endpoint or a loopback port, so both the URL and the addresses
-// its host resolves to are checked — the second at delivery time, so a rebinding DNS answer
-// cannot slip through between saving the setting and sending.
+// its host resolves to are checked. The address check runs inside the connection's own DNS
+// lookup (`guardedPost`), so the socket can only open to an address that was just checked: a
+// rebinding DNS answer cannot slip in between the check and the connect.
 
 function blockedV4(address: string): boolean {
   const parts = address.split(".").map(Number);
@@ -115,8 +118,41 @@ export function webhookUrlProblem(raw: unknown): string | undefined {
 /** A failure that retrying cannot fix: a bad target, a private address, a redirect or a 4xx. */
 class Permanent extends Error {}
 
+/**
+ * The connection's DNS lookup: resolve every address, refuse the lot if any is private, and hand
+ * the socket only checked addresses. Used as `lookup` on the request, so it runs at connect time.
+ */
+export const guardedLookup: LookupFunction = (hostname, options, callback) => {
+  lookupCallback(hostname, { all: true, verbatim: true }, (err, addresses: LookupAddress[]) => {
+    if (err) return callback(err, "", 0);
+    if (addresses.length === 0) return callback(new Error(`webhook host ${hostname} did not resolve`), "", 0);
+    if (addresses.some((entry) => isPrivateAddress(entry.address))) {
+      return callback(new Permanent("webhook host resolves to a private or loopback address"), "", 0);
+    }
+    if (options.all) return callback(null, addresses);
+    const first = addresses[0]!;
+    return callback(null, first.address, first.family);
+  });
+};
+
+/** POST over https through `guardedLookup`. Redirects are never followed; the body is not read. */
+function guardedPost(url: string, headers: Record<string, string>, body: string, timeoutMs: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { method: "POST", headers, lookup: guardedLookup, timeout: timeoutMs }, (res) => {
+      res.resume();
+      resolve(res.statusCode ?? 0);
+    });
+    req.on("timeout", () => req.destroy(new Error(`webhook did not answer within ${timeoutMs} ms`)));
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
 export interface WebhookOptions {
-  /** Injected in tests so no delivery leaves the machine. */
+  /**
+   * Injected in tests so no delivery leaves the machine. Without it a delivery goes through
+   * `guardedPost`, which re-checks the addresses at connect time.
+   */
   fetch?: typeof fetch;
   /** Resolves a hostname to every address it has; injected in tests. */
   resolve?: (hostname: string) => Promise<string[]>;
@@ -133,7 +169,7 @@ const resolveAll = async (hostname: string): Promise<string[]> =>
   (await lookup(hostname, { all: true, verbatim: true })).map((entry) => entry.address);
 
 export class WebhookSender {
-  private readonly fetchImpl: typeof fetch;
+  private readonly fetchImpl: typeof fetch | undefined;
   private readonly resolve: (hostname: string) => Promise<string[]>;
   private readonly pause: (ms: number) => Promise<void>;
   private readonly log: (message: string, error?: unknown) => void;
@@ -142,7 +178,7 @@ export class WebhookSender {
   private readonly baseDelayMs: number;
 
   constructor(options: WebhookOptions = {}) {
-    this.fetchImpl = options.fetch ?? fetch;
+    this.fetchImpl = options.fetch;
     this.resolve = options.resolve ?? resolveAll;
     this.pause = options.pause ?? ((ms) => pauseFor(ms, undefined, { ref: false }));
     this.log = options.log ?? ((message, error) => console.error(message, error));
@@ -169,20 +205,29 @@ export class WebhookSender {
 
     // Sign exactly the bytes that are sent, so a receiver's HMAC check is over the raw body.
     const body = JSON.stringify(event);
-    const response = await this.fetchImpl(url, {
-      method: "POST",
-      redirect: "manual",
-      headers: {
-        "content-type": "application/json",
-        "user-agent": "concord-webhook/1",
-        "x-concord-event": event.type,
-        [SIGNATURE_HEADER]: sign(secret, body),
-      },
-      body,
-      signal: AbortSignal.timeout(this.timeoutMs),
-      // A webhook call is not a browser session and must not carry cookies anywhere.
-      credentials: "omit",
-    });
+    const headers = {
+      "content-type": "application/json",
+      "user-agent": "concord-webhook/1",
+      "x-concord-event": event.type,
+      [SIGNATURE_HEADER]: sign(secret, body),
+    };
+    let status: number;
+    if (this.fetchImpl) {
+      const answer = await this.fetchImpl(url, {
+        method: "POST",
+        redirect: "manual",
+        headers,
+        body,
+        signal: AbortSignal.timeout(this.timeoutMs),
+        credentials: "omit",
+      });
+      // Release the socket; the body of a webhook answer is not read.
+      await answer.body?.cancel().catch(() => {});
+      status = answer.status;
+    } else {
+      status = await guardedPost(url, headers, body, this.timeoutMs);
+    }
+    const response = { status, ok: status >= 200 && status < 300 };
     if (response.status >= 300 && response.status < 400) {
       throw new Permanent(`webhook answered with a redirect (${response.status}), which is not followed`);
     }
@@ -192,8 +237,6 @@ export class WebhookSender {
       const retryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
       throw retryable ? new Error(message) : new Permanent(message);
     }
-    // Release the socket; the body of a webhook answer is not read.
-    await response.body?.cancel().catch(() => {});
   }
 
   /**
