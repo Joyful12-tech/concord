@@ -174,6 +174,47 @@ ALTER TABLE assets ADD COLUMN movement_window_hours INTEGER NOT NULL DEFAULT 24;
 `,
   // v5: per-asset reconciliation tolerance (smallest units as TEXT to preserve bigint precision).
   `ALTER TABLE assets ADD COLUMN tolerance TEXT;`,
+  // v6: holdings checkpoints, so a historical holdings(asOf) or a corporate-action snapshot replays
+  // only the events after the nearest earlier checkpoint. Derived data: Concord rebuilds any row
+  // it finds missing, so deleting them is always safe.
+  `
+CREATE TABLE holdings_checkpoints (
+  asset_id TEXT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
+  ledger INTEGER NOT NULL,
+  closed_at TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (asset_id, ledger)
+);
+CREATE INDEX events_asset_ledger ON events (asset_id, ledger);
+`,
+  // v7: runs list columns (summary, status, chain_behind, open_breaks), backfilled from stored result bodies, so listing never parses them
+  `
+ALTER TABLE runs ADD COLUMN summary TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE runs ADD COLUMN status TEXT NOT NULL DEFAULT 'clean';
+ALTER TABLE runs ADD COLUMN chain_behind INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN open_breaks INTEGER NOT NULL DEFAULT 0;
+UPDATE runs SET
+  summary = COALESCE(json_extract(result, '$.summary'), '{}'),
+  status = COALESCE(json_extract(result, '$.status'), 'clean'),
+  chain_behind = COALESCE(json_extract(result, '$.chainBehind'), 0),
+  open_breaks = (
+    SELECT COUNT(*) FROM json_each(runs.result, '$.breaks') b
+    WHERE NOT EXISTS (
+      SELECT 1 FROM break_notes n
+      WHERE n.asset_id = runs.asset_id AND n.scope = 'recon'
+        AND n.key = json_extract(b.value, '$.key')
+        AND n.fingerprint = json_extract(b.value, '$.fingerprint')
+        AND n.status <> 'open'
+    )
+  );
+`,
+  // v8: an action entered in error is voided rather than deleted, so it keeps its place in the audit trail
+  `
+ALTER TABLE actions ADD COLUMN voided_at TEXT;
+ALTER TABLE actions ADD COLUMN voided_by TEXT;
+ALTER TABLE actions ADD COLUMN void_reason TEXT;
+`,
 ];
 
 /** Identity: who may sign in, and which workspace each session is bound to. */

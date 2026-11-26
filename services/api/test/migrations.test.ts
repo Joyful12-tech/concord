@@ -77,6 +77,38 @@ describe("databases written by earlier builds", () => {
     });
   });
 
+  it("adds an empty holdings checkpoint table and the event ledger index to a v5 workspace database", () => {
+    upgraded("org-v5.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM holdings_checkpoints")?.n).toBe(0);
+      expect(db.get("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'events_asset_ledger'")).toBeDefined();
+    });
+  });
+
+  it("opens the v6 workspace database and keeps its holdings checkpoints", () => {
+    upgraded("org-v6.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v6");
+      expect(db.get<{ ledger: number }>("SELECT ledger FROM holdings_checkpoints WHERE asset_id = 'usd-mainnet'")?.ledger).toBe(100);
+    });
+  });
+
+  it("opens the v7 workspace database and keeps its runs list columns", () => {
+    upgraded("org-v7.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v7");
+      expect(db.get<{ status: string; open_breaks: number }>("SELECT status, open_breaks FROM runs")).toEqual({
+        status: "breaks",
+        open_breaks: 1,
+      });
+    });
+  });
+
+  it("opens the v8 workspace database and keeps a voided action's trail", () => {
+    upgraded("org-v8.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v8");
+      expect(db.get("SELECT voided_by, void_reason FROM actions WHERE id = 2")).toEqual({ voided_by: "bob", void_reason: "typo in the rate" });
+      expect(db.get<{ voided_at: string | null }>("SELECT voided_at FROM actions WHERE id = 1")?.voided_at).toBeNull();
+    });
+  });
+
   it("opens the v1 control database with the current migrations and keeps its rows", () => {
     upgraded("control-v1.db", CONTROL_MIGRATIONS, (db) => {
       expect(db.get<{ name: string }>("SELECT name FROM users WHERE id = 'u1'")?.name).toBe("Alice");

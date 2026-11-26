@@ -51,7 +51,7 @@ error. Positional arguments and options may appear in any order.
 | `--decimals <0-18>` | `watch` | Decimals of a contract token that does not state them. Classic assets always have 7. |
 | `--as-of <ISO>` | `holdings`, `register` | Point in time. Required by `register`. |
 | `--register <id>` | `reconcile` | Reconcile this register import instead of the latest. |
-| `--fail-on-breaks` | `reconcile-all` | Exit `1` when any asset has open breaks. |
+| `--fail-on-breaks` | `register`, `reconcile`, `reconcile-all` | Exit `2` when the reconciliation (or any asset's) has open breaks. Signed-off breaks do not count. |
 | `--record <ISO>` | `action` | Record time: holdings at this instant are the entitlement basis. Required. |
 | `--rate <decimal>` | `action ... dividend` | Pay-asset units per whole unit held. Required for a dividend. |
 | `--pay-asset <asset>` | `action ... dividend` | Watched asset the dividend is paid in, on the same network. Defaults to the asset itself. |
@@ -203,8 +203,8 @@ Human output is a table of asset, status, open breaks and error, then one line c
 assets, the reconciliations with open breaks and the failures. With `--json`, the array of
 `{asset, status, openBreaks, error}` rows (`null` where a field does not apply).
 
-It exits `1` if any asset failed, or when `--fail-on-breaks` is given and any reconciliation has
-open breaks; otherwise `0`, so a daily run can treat breaks as a finding rather than a crash.
+It exits `1` if any asset failed, `2` when `--fail-on-breaks` is given and any reconciliation has
+open breaks, and otherwise `0`, so a daily run can tell breaks from a crash.
 
 ### `action ASSET <dividend|split|redemption> --record ISO ...`
 
@@ -242,6 +242,12 @@ corporate actions, controls log and events, with a `generatedAt`, a `generator` 
 of the contents. With `--csv`, one section: `holdings`, `events`, `controls` or `breaks`.
 With `--out FILE` it writes the file and prints `wrote FILE`; otherwise it writes to standard
 output with no trailing newline. `--json` has no effect: JSON is already the default.
+
+### `verify-pack FILE`
+
+Recomputes the RFC 8785 canonical JSON digest over `FILE` (excluding `sha256` and `generatedAt`)
+and compares it with the pack's `sha256` field. Prints `OK` on success, or a mismatch error
+and exits with code 1 if the digest does not match.
 
 ## Operator commands
 
@@ -298,14 +304,14 @@ Runs the API and dashboard, the same as `pnpm start` does for the built output.
 
 ## Exit codes
 
-There are two. `0` is success; `1` is any error, with the message on standard error. Errors
+There are three. `0` is success; `1` is any error, with the message on standard error; `2` means
+open breaks, and only with `--fail-on-breaks`. Errors
 include a missing argument or option, an unknown command (the usage text follows the message), a
 workspace or asset that does not exist, a CSV that cannot be read at all, a destructive command
 (`unwatch`, `org-delete`) run without `--yes` on a non-interactive stdin, and a Stellar RPC
-failure that stops the command. A command that finds reconciliation breaks still exits `0`, so a
-script that cares has to read the result (`status` in the `--json` output of `reconcile`).
-`reconcile-all` also exits `1` when any asset failed, or with `--fail-on-breaks` when any asset
-has open breaks.
+failure that stops the command. A command that finds reconciliation breaks still exits `0` unless
+`--fail-on-breaks` is given to `register`, `reconcile` or `reconcile-all`, which then exit `2`.
+`reconcile-all` also exits `1` when any asset failed.
 
 ## Daily reconciliation from cron
 

@@ -46,13 +46,14 @@ erDiagram
     assets ||--o{ runs : "asset_id"
     assets ||--o{ actions : "asset_id"
     assets ||--o{ break_notes : "asset_id"
+    assets ||--o{ holdings_checkpoints : "asset_id"
     registers ||--o{ register_positions : "register_id"
     registers ||--o{ runs : "register_id"
 ```
 
 Every arrow is `ON DELETE CASCADE`. Deleting an asset therefore deletes its events, opening
 balances, registers (and through them their positions and runs), journal, instructions, corporate
-actions and break notes. Deleting a register deletes its positions *and the runs made from it*.
+actions, break notes and holdings checkpoints. Deleting a register deletes its positions *and the runs made from it*.
 `meta` stands alone.
 
 ### `meta`
@@ -89,7 +90,8 @@ One row per watched asset.
 
 ### `events`
 
-On-chain events (CAP-67) for an asset. Primary key `(asset_id, id)`.
+On-chain events (CAP-67) for an asset. Primary key `(asset_id, id)`; index `events_asset_ledger`
+on `(asset_id, ledger)` (migration 6) serves the replay from a holdings checkpoint.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -186,6 +188,9 @@ One row per reconciliation. Index `runs_asset (asset_id, id)` and `runs_register
 | `register_id` | INTEGER | → `registers.id`. NOT NULL: a run always belongs to a register. |
 | `as_of` | TEXT | The register's as-of time. |
 | `created_by`, `created_at` | TEXT | |
+| `summary` | TEXT (JSON) | Copy of `result.summary` (migration 7), so the runs list never parses `result`. |
+| `status`, `chain_behind` | TEXT, INTEGER | Copies of `result.status` and `result.chainBehind` (migration 7). |
+| `open_breaks` | INTEGER | Breaks not signed off (migration 7). Rewritten for the asset whenever a reconciliation break is signed off or reopened. |
 | `result` | TEXT (JSON) | See below. |
 
 `result` holds the whole outcome, so a past run can be shown without recomputing it:
@@ -224,6 +229,7 @@ Corporate actions. Index `actions_asset (asset_id, record_time)`.
 | `result` | TEXT (JSON), null | Reconciliation of the action, below. |
 | `created_by`, `created_at` | TEXT | |
 | `reconciled_at` | TEXT, null | |
+| `voided_at`, `voided_by`, `void_reason` | TEXT | Set when an action entered in error is voided (migration 8). A voided action is never reconciled again and has no open breaks, but stays in the audit pack with the reason. |
 
 `params` always has `exclude` (array of addresses). A dividend adds `ratePerUnit` (decimal
 string, pay-asset units per whole unit held), `payAsset` (the id of a watched asset, which is
@@ -262,6 +268,27 @@ Append-only trail of every sign-off change (added in migration 2, which copies t
 existed). One row per `setNote` call: `id`, `asset_id`, `scope`, `key`, `fingerprint`, `status`,
 `note`, `author`, `author_id`, `at`. It is what the audit pack lists as `signoffHistory` and what
 `GET /api/assets/:id/notes/history?scope=&key=` returns, oldest first.
+
+### `holdings_checkpoints`
+
+Replayed holdings at a ledger boundary (added in migration 6), so a historical
+`holdings(asOf)`, a corporate-action snapshot or the dashboard's current holdings replays only the
+events after the nearest earlier checkpoint instead of the whole history. Primary key
+`(asset_id, ledger)`. Derived data: every row can be deleted at any time, and Concord writes them
+again on the next read (`Concord.state`, `services/api/src/concord.ts`).
+
+| Column | Type | Notes |
+|---|---|---|
+| `asset_id` | TEXT | → `assets.id` |
+| `ledger` | INTEGER | Every event of the asset at or before this ledger is folded in; every later one is not. |
+| `closed_at` | TEXT | Latest close time among the folded events. Used only for as-of times at or after it. |
+| `state` | TEXT (JSON) | `balances` and `authorized` keyed by address (balances are smallest-unit integer strings), `ledger`, `eventCount`, and the malformed events skipped so far. |
+| `created_at` | TEXT | |
+
+A checkpoint is written after every 1,000 events not yet covered, never on the newest indexed
+ledger (more of its events may still arrive). An event indexed into a ledger at or before a
+checkpoint deletes that checkpoint and every later one; rebuilding an asset, or re-reading its
+opening balances, deletes all of its checkpoints.
 
 ## Control database (`control.db`)
 
