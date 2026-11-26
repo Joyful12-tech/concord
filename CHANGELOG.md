@@ -34,6 +34,12 @@ A `docs`-only or internal refactoring commit does not need an entry. When in dou
 
 Everything to date; Concord's history begins 2026-10 with the commits below.
 
+### Changed
+
+- `unwatch` and `org-delete` now require `--yes` (or a TTY prompt) before deleting anything
+  and support `--dry-run` to print the counts of events, registers, runs and notes that would
+  be removed; without `--yes` nothing is deleted and the command exits with code 1 (#558).
+
 ### Fixed
 
 - The CLI answers an unknown flag, or a flag missing its value, with one line that names the
@@ -57,6 +63,12 @@ Everything to date; Concord's history begins 2026-10 with the commits below.
 - A per-asset reconciliation `tolerance` (smallest units): a holder whose chain and register
   balances differ by no more than it is treated as matched. Schema: `ORG_MIGRATIONS` v5 adds
   `assets.tolerance` (#564).
+- Void a corporate action entered in error (`POST /api/actions/:id/void`, reason required) (#544).
+  It keeps its place in the audit trail with no open breaks. Schema: `ORG_MIGRATIONS` entry 8 adds
+  `actions.voided_at`, `voided_by` and `void_reason`.
+- The runs list reads summary columns instead of parsing every stored result body (#531).
+  Schema: `ORG_MIGRATIONS` entry 7 adds `runs.summary`, `status`, `chain_behind` and `open_breaks`,
+  backfilled from existing results.
 - Holdings checkpoints (#576): historical holdings (`asOf`), corporate-action snapshots and the
   current holdings replay from the nearest stored checkpoint, so their cost near the tip no longer
   grows with the length of the history. Results are unchanged. Schema: `ORG_MIGRATIONS` entry 6

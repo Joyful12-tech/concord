@@ -1,11 +1,11 @@
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, basename } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
-import { backup } from "node:sqlite";
+import { DatabaseSync, backup } from "node:sqlite";
 import { parseArgs } from "node:util";
-import type { ActionInput, Actor, Concord, DeletionCounts, WatchInput } from "./concord.js";
+import { NotFound, type ActionInput, type Actor, type Concord, type DeletionCounts, type WatchInput, verifyPack } from "./concord.js";
 import { isNetworkName, loadConfig } from "./config.js";
 import { openRuntime, startServer } from "./main.js";
 import { CLI_OPTIONS, USAGE, describeArgsError } from "./cli-usage.js";
@@ -13,6 +13,38 @@ import { CLI_OPTIONS, USAGE, describeArgsError } from "./cli-usage.js";
 function table(rows: Array<Record<string, unknown>>): void {
   if (rows.length === 0) return console.log("(none)");
   console.table(rows);
+}
+
+/** Open a backup copy read-only and check its integrity and schema version; throws naming the file. */
+export function verifyBackupFile(filePath: string, expectedUserVersion: number): void {
+  let db: DatabaseSync;
+  try {
+    db = new DatabaseSync(filePath, { readOnly: true });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`corrupted backup: ${filePath} failed to open (${msg})`);
+  }
+  try {
+    const rows = db.prepare("PRAGMA integrity_check").all() as Array<Record<string, unknown>>;
+    const result = rows.length > 0 ? String(Object.values(rows[0]!)[0]) : "";
+    if (result !== "ok") throw new Error(`corrupted backup: ${filePath} failed integrity check (${result})`);
+    const versionRow = db.prepare("PRAGMA user_version").get() as Record<string, unknown> | undefined;
+    const version = versionRow ? Number(Object.values(versionRow)[0]) : -1;
+    if (version !== expectedUserVersion) {
+      throw new Error(`corrupted backup: ${filePath} user_version mismatch (expected ${expectedUserVersion}, got ${version})`);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith("corrupted backup:")) throw err;
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`corrupted backup: ${filePath} failed integrity check (${msg})`);
+  } finally {
+    db.close();
+  }
+}
+
+function userVersion(db: DatabaseSync): number {
+  const row = db.prepare("PRAGMA user_version").get() as Record<string, unknown> | undefined;
+  return row ? Number(Object.values(row)[0]) : 0;
 }
 
 function parseCommandLine(args: string[]) {
@@ -33,6 +65,22 @@ export async function runCli(
   const [command, a, b] = positionals;
   if (!command || values.help) return console.log(USAGE);
   if (command === "serve") return startServer();
+  if (command === "restore") {
+    // Runs without opening the runtime: the destination must not be in use.
+    if (!a) throw new Error(`missing backup directory\n\n${USAGE}`);
+    const srcDir = resolve(a);
+    const destDir = resolve(values.into ?? loadConfig(env).dataDir);
+    if (!existsSync(join(srcDir, "control.db"))) {
+      throw new Error(`not a valid backup directory: missing control.db in ${srcDir}`);
+    }
+    if (existsSync(destDir) && readdirSync(destDir).length > 0 && !values.force) {
+      throw new Error(`destination directory ${destDir} is not empty; pass --force to overwrite`);
+    }
+    mkdirSync(destDir, { recursive: true });
+    cpSync(srcDir, destDir, { recursive: true, force: true });
+    console.log(`restored backup from ${srcDir} into ${destDir}`);
+    return;
+  }
 
   const config = loadConfig(env);
   const runtime = openRuntime(config);
@@ -46,6 +94,7 @@ export async function runCli(
     const list = (value: string | undefined) => (value ? value.split(",").map((s) => s.trim()).filter(Boolean) : []);
     const out = (value: unknown) => console.log(JSON.stringify(value, null, 2));
     const orgRef = values.org ?? env.CONCORD_ORG;
+  const workspace = (): Concord => tenants.forOrg(auth.findOrg(need(orgRef, "--org (see `concord orgs`)")).id);
   /**
    * A delete shows what it would remove and then does nothing until the operator confirms, with
    * `--yes` or by answering the prompt on a terminal. `--dry-run` stops after the counts.
@@ -70,7 +119,6 @@ export async function runCli(
     }
     throw new Error(`nothing was deleted: ${what} needs --yes`);
   };
-  const workspace = (): Concord => tenants.forOrg(auth.findOrg(need(orgRef, "--org (see `concord orgs`)")).id);
   const printRun = (run: Awaited<ReturnType<Concord["reconcile"]>>) => {
     if (values.json) return out(run);
     console.log(`reconciliation ${run.id} · as of ${run.asOf} · ${run.status.toUpperCase()}`);
@@ -128,8 +176,15 @@ export async function runCli(
     case "backup": {
       const dir = resolve(need(a, "directory"));
       mkdirSync(join(dir, "orgs"), { recursive: true });
-      await backup(runtime.control.raw, join(dir, "control.db"));
-      for (const id of auth.orgIds()) await backup(tenants.forOrg(id).db.raw, join(dir, "orgs", `${id}.db`));
+      const controlFile = join(dir, "control.db");
+      await backup(runtime.control.raw, controlFile);
+      if (values.verify) verifyBackupFile(controlFile, userVersion(runtime.control.raw));
+      for (const id of auth.orgIds()) {
+        const orgFile = join(dir, "orgs", `${id}.db`);
+        const orgDb = tenants.forOrg(id).db.raw;
+        await backup(orgDb, orgFile);
+        if (values.verify) verifyBackupFile(orgFile, userVersion(orgDb));
+      }
       console.log(`backed up control.db and ${auth.orgIds().length} workspaces to ${dir}`);
       break;
     }
@@ -199,7 +254,7 @@ export async function runCli(
       const file = need(b, "file");
       const imported = concord.importRegister(
         asset,
-        { csv: readFileSync(file, "utf8"), asOf: need(values["as-of"], "--as-of"), source: file },
+        { csv: readFileSync(file, "utf8"), asOf: need(values["as-of"], "--as-of"), source: basename(file) },
         actor,
       );
       if (imported.duplicate) {
@@ -208,7 +263,11 @@ export async function runCli(
         console.log(`register ${imported.registerId}: ${imported.positions} positions, ${imported.issues.length} rejected rows`);
         for (const issue of imported.issues) console.log(`  line ${issue.line}: ${issue.message}`);
       }
-      printRun((imported.duplicate && concord.latestRunForRegister(imported.registerId)) || (await concord.reconcile(asset, imported.registerId, actor)));
+      const run =
+        (imported.duplicate && concord.latestRunForRegister(imported.registerId)) ||
+        (await concord.reconcile(asset, imported.registerId, actor));
+      printRun(run);
+      if (values["fail-on-breaks"] && run.openBreaks > 0) process.exitCode = 2;
       break;
     }
     case "registers": {
@@ -301,9 +360,12 @@ export async function runCli(
       );
       break;
     }
-    case "reconcile":
-      printRun(await workspace().reconcile(need(a, "asset"), values.register ? Number(values.register) : undefined, actor));
+    case "reconcile": {
+      const run = await workspace().reconcile(need(a, "asset"), values.register ? Number(values.register) : undefined, actor);
+      printRun(run);
+      if (values["fail-on-breaks"] && run.openBreaks > 0) process.exitCode = 2;
       break;
+    }
     case "runs": {
       const limit = values.limit ? Number(values.limit) : undefined;
       if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
@@ -378,6 +440,16 @@ export async function runCli(
       );
       break;
     }
+    case "break-history": {
+      const concord = workspace();
+      const asset = need(a, "asset");
+      const scope = need(b ?? values.scope, "scope");
+      const key = need(positionals[3] ?? values.key, "break key");
+      const history = concord.breakHistory(asset, scope, key);
+      if (values.json) return out(history);
+      table(history);
+      break;
+    }
     case "export": {
       const concord = workspace();
       const asset = need(a, "asset");
@@ -386,12 +458,71 @@ export async function runCli(
       if (values.to) period.to = values.to;
       const text = values.csv
         ? concord.exportCsv(asset, values.csv, period)
-        : JSON.stringify(concord.auditExport(asset, period), null, 2);
+        : JSON.stringify(concord.auditExport(asset, period, config.signingKey ? { signingKey: config.signingKey } : {}), null, 2);
       if (values.out) {
         writeFileSync(values.out, text);
         console.log(`wrote ${values.out}`);
       } else {
         process.stdout.write(text);
+      }
+      break;
+    }
+    case "signoff": {
+      const asset = need(a, "asset");
+      const scope = need(values.scope, "--scope");
+      const key = need(values.key, "--key");
+      const rawStatus = need(values.status, "--status");
+      if (!/^(recon|controls|action:[1-9]\d*)$/.test(scope)) {
+        throw new Error("--scope must be recon, controls, or action:N (N a positive integer)");
+      }
+      if (!["open", "acknowledged", "resolved"].includes(rawStatus)) {
+        throw new Error("--status must be open, acknowledged, or resolved");
+      }
+      const status = rawStatus as "open" | "acknowledged" | "resolved";
+      // A note is required to acknowledge or resolve a break; reopening needs none.
+      const note = values.note ?? "";
+      if (status !== "open" && !note.trim()) throw new Error(`--note is required when --status is ${status}`);
+      const concord = workspace();
+      const assetRecord = concord.asset(asset);
+      let breaks: Array<{ key: string; fingerprint: string }>;
+      if (scope === "recon") {
+        const r = values.run !== undefined ? concord.run(Number(values.run)) : concord.latestRun(assetRecord.id);
+        if (!r) throw new Error("no reconciliation run found for this asset");
+        breaks = r.breaks;
+      } else if (scope === "controls") {
+        breaks = concord.controls(assetRecord.id).breaks;
+      } else {
+        breaks = concord.action(Number(scope.slice("action:".length))).result?.breaks ?? [];
+      }
+      const brk = breaks.find((x) => x.key === key);
+      if (!brk) throw new NotFound(`no break ${key} in the current ${scope.split(":")[0]} results`);
+      concord.setNote(asset, scope, key, { fingerprint: brk.fingerprint, status, note }, actor);
+      if (values.json) return out({ ok: true, asset, scope, key, status });
+      console.log(`signed off: ${key} → ${status.toUpperCase()}`);
+      break;
+    }
+    case "verify-pack": {
+      const file = need(a, "pack file");
+      // `pnpm concord` runs from services/api; INIT_CWD is where the operator typed the command.
+      const raw = readFileSync(existsSync(file) ? file : resolve(env.INIT_CWD ?? process.cwd(), file), "utf8");
+      const pack = JSON.parse(raw);
+      const res = verifyPack(pack, values.key ? resolve(values.key) : undefined);
+      if (values.json) {
+        out(res);
+      } else {
+        if (!res.digestValid) {
+          console.error(`FAIL: digest mismatch (expected ${res.expectedDigest}, got ${res.digest})`);
+          process.exitCode = 1;
+        } else if (res.signatureChecked && !res.signatureValid) {
+          console.error(`FAIL: signature verification failed: ${res.error ?? "invalid signature"}`);
+          process.exitCode = 1;
+        } else if (res.signatureChecked && res.signatureValid) {
+          console.log(`OK: digest verified (${res.digest}), signature valid (key: ${res.keyId})`);
+        } else if (res.signed) {
+          console.log(`OK: digest verified (${res.digest}), pack is signed (key: ${res.keyId})`);
+        } else {
+          console.log(`OK: digest verified (${res.digest})`);
+        }
       }
       break;
     }

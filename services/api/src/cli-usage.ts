@@ -32,7 +32,15 @@ export const CLI_OPTIONS = {
   role: { type: "string" },
   limit: { type: "string" },
   before: { type: "string" },
+  scope: { type: "string" },
+  verify: { type: "boolean" },
+  into: { type: "string" },
+  force: { type: "boolean", short: "f" },
+  status: { type: "string" },
+  key: { type: "string" },
+  run: { type: "string" },
   json: { type: "boolean" },
+  "fail-on-breaks": { type: "boolean" },
   yes: { type: "boolean", short: "y" },
   "dry-run": { type: "boolean" },
   help: { type: "boolean", short: "h" },
@@ -107,8 +115,7 @@ export function describeArgsError(
     }
   }
   // Something parseArgs refused that the tokens do not show: keep its first line.
-  return `${String((err as Error).message).split("
-")[0]} ${HELP_HINT}`;
+  return `${String((err as Error).message).split("\n")[0]} ${HELP_HINT}`;
 }
 
 export const USAGE = `concord — reconcile tokenized securities on Stellar against the register
@@ -125,6 +132,7 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   sync [ASSET]                     pull new events (every workspace when no --org)
   holdings ASSET [--as-of ISO]     on-chain holders
   register ASSET FILE --as-of ISO  import a register export and reconcile it
+        [--fail-on-breaks]
   registers ASSET                  list imported registers
   register-delete ASSET ID [--yes] remove a register and its reconciliation runs
   journal ASSET FILE               import the register's transaction journal
@@ -132,6 +140,7 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   instructions ASSET FILE          import control instructions
   instructions-list ASSET          list imported control instructions
   reconcile ASSET [--register ID]  re-run a reconciliation
+        [--fail-on-breaks]
   runs ASSET [--limit N]           list reconciliation runs for an asset
   run ID                           show one reconciliation run
   action ASSET dividend --record ISO --rate R [--pay-asset A] [--payer G...] [--until ISO]
@@ -140,6 +149,10 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   actions ASSET                    corporate actions and their state
   controls ASSET                   freeze, authorisation and clawback log
   export ASSET [--from ISO] [--to ISO] [--csv SECTION] [--out FILE]
+  break-history ASSET SCOPE KEY     sign-off history of one break, oldest first
+  signoff ASSET --scope recon|controls|action:N --key KEY --status open|acknowledged|resolved
+        [--note TEXT] [--run N]
+  verify-pack FILE [--key PEM]     check an audit pack's digest, and its signature with --key
 
 Operator commands.
 
@@ -150,10 +163,16 @@ Operator commands.
   invite ORG EMAIL [--role owner|member]  create a workspace invitation link
   org-delete ORG [--yes] [--dry-run]
                                    delete a workspace and everything in it
-  backup DIR                       copy every database to DIR while the server runs
+  backup DIR [--verify]            copy every database to DIR while the server runs; --verify
+                                   checks each copy's integrity and schema version
+  restore DIR [--into DIR2] [--force]
+                                   copy a backup into the data directory (refuses a non-empty one)
   serve                            run the API and dashboard
 
-unwatch and org-delete print deletion counts and require --yes (or a terminal confirmation); --dry-run only prints counts.
-
 ASSET is a code or a contract id. Add --json to most commands for machine-readable output,
-or --help (-h) to see this text. Settings come from the environment; see .env.example.`;
+or --help (-h) to see this text. Settings come from the environment; see .env.example.
+
+unwatch and org-delete print what they would remove and delete nothing until --yes is given
+(or the prompt is answered on a terminal); --dry-run prints the counts and stops.
+
+Exit codes: 0 success, 1 error, 2 open breaks (--fail-on-breaks).`;

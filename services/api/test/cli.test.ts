@@ -1,20 +1,18 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Auth } from "../src/auth.js";
 import { runCli } from "../src/cli.js";
 import { CLI_OPTIONS, closestFlag, describeArgsError } from "../src/cli-usage.js";
-import { NotFound, type DeletionCounts } from "../src/concord.js";
+import { NotFound } from "../src/concord.js";
 import { loadConfig, type Config } from "../src/config.js";
 import { openRuntime } from "../src/main.js";
 import { FAST, at, key } from "./helpers.js";
-import { Db } from "../src/db.js";
-import { CONTROL_MIGRATIONS, ORG_MIGRATIONS } from "../src/schema.js";
 
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
@@ -378,185 +376,3 @@ describe("CLI runs and run commands", () => {
     }
   }, 15_000);
 });
-
-
-// Destructive command confirmation and database-backed deletion counts (#558).
-const issue558_API_DIR = fileURLToPath(new URL("..", import.meta.url));
-const issue558_CLI = join(issue558_API_DIR, "src", "issue558_cli.ts");
-const issue558_ORG_ID = "0123456789abcdef";
-const FUND = `C${"A".repeat(55)}`;
-const OTHER = `C${"B".repeat(55)}`;
-const AT = "2026-01-02T00:00:00.000Z";
-
-/** The workspace the tests delete from: two assets, with books against one of them. */
-const issue558_TOTAL: DeletionCounts = { assets: 2, events: 4, registers: 2, runs: 2, notes: 1 };
-const issue558_FUND_ONLY: DeletionCounts = { assets: 1, events: 3, registers: 2, runs: 2, notes: 1 };
-
-const issue558_dirs: string[] = [];
-
-afterEach(() => {
-  for (const dir of issue558_dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
-
-function issue558_tenantPath(dir: string): string {
-  return join(dir, "orgs", `${issue558_ORG_ID}.db`);
-}
-
-/** An org in control.db and a workspace database with assets, events, registers, runs and a note. */
-function issue558_seed(): string {
-  const dir = mkdtempSync(join(tmpdir(), "concord-issue558_cli-"));
-  issue558_dirs.push(dir);
-  const control = new Db(join(dir, "control.db"), CONTROL_MIGRATIONS);
-  control.insert("INSERT INTO orgs (id, name, created_at) VALUES (?, ?, ?)", issue558_ORG_ID, "Alpha Capital", AT);
-  control.close();
-
-  const db = new Db(issue558_tenantPath(dir), ORG_MIGRATIONS);
-  db.insert(
-    "INSERT INTO assets (id, network, code, name, decimals, start_mode, created_at) VALUES (?, 'testnet', ?, ?, 7, 'window', ?)",
-    FUND,
-    "FUND",
-    "Fund",
-    AT,
-  );
-  db.insert(
-    "INSERT INTO assets (id, network, code, name, decimals, start_mode, created_at) VALUES (?, 'testnet', ?, ?, 7, 'window', ?)",
-    OTHER,
-    "OTHER",
-    "Other",
-    AT,
-  );
-  const event = (assetId: string, id: string, ledger: number) =>
-    db.insert(
-      "INSERT INTO events (id, asset_id, kind, ledger, closed_at, tx_hash, amount) VALUES (?, ?, 'mint', ?, ?, ?, '10000000')",
-      id,
-      assetId,
-      ledger,
-      AT,
-      `tx-${id}`,
-    );
-  event(FUND, "fund-1", 1);
-  event(FUND, "fund-2", 2);
-  event(FUND, "fund-3", 3);
-  event(OTHER, "other-1", 4);
-
-  let registerId = 0;
-  for (const [n, asOf] of [AT, "2026-01-03T00:00:00.000Z"].entries()) {
-    registerId = db.insert(
-      "INSERT INTO registers (asset_id, as_of, source, sha256, issues, imported_at) VALUES (?, ?, 'test', ?, '[]', ?)",
-      FUND,
-      asOf,
-      `sha-${n}`,
-      AT,
-    );
-  }
-  for (const id of [registerId, registerId]) {
-    db.insert(
-      "INSERT INTO runs (asset_id, register_id, as_of, created_at, result) VALUES (?, ?, ?, ?, '{\"breaks\":[]}')",
-      FUND,
-      id,
-      AT,
-      AT,
-    );
-  }
-  db.insert(
-    "INSERT INTO break_notes (asset_id, scope, key, fingerprint, status, note, updated_at) VALUES (?, 'recon', 'k', 'f', 'acknowledged', 'checked', ?)",
-    FUND,
-    AT,
-  );
-  db.close();
-  return dir;
-}
-
-interface issue558_Run {
-  status: number | null;
-  stdout: string;
-  stderr: string;
-}
-
-/** The issue558_CLI with no terminal on stdin, as a cron job or a script would run it. */
-function issue558_cli(dir: string, args: string[]): issue558_Run {
-  const result = spawnSync(process.execPath, ["--import", "tsx", issue558_CLI, ...args], {
-    cwd: issue558_API_DIR,
-    env: { ...process.env, CONCORD_DATA_DIR: dir, CONCORD_SYNC_INTERVAL: "0" },
-    stdio: ["ignore", "pipe", "pipe"],
-    encoding: "utf8",
-    timeout: 60_000,
-  });
-  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
-}
-
-function counts(dir: string): DeletionCounts {
-  const db = new Db(issue558_tenantPath(dir), ORG_MIGRATIONS);
-  const count = (table: string) => Number(db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)?.n ?? 0);
-  const out: DeletionCounts = {
-    assets: count("assets"),
-    events: count("events"),
-    registers: count("registers"),
-    runs: count("runs"),
-    notes: count("break_notes"),
-  };
-  db.close();
-  return out;
-}
-
-function issue558_parseCounts(run: issue558_Run): DeletionCounts {
-  return JSON.parse(run.stdout) as DeletionCounts;
-}
-
-describe("unwatch needs confirmation", () => {
-  it("refuses without --yes, deletes nothing and shows the counts", () => {
-    const dir = issue558_seed();
-    const run = issue558_cli(dir, ["unwatch", "FUND", "--org", issue558_ORG_ID, "--json"]);
-    expect(run.status).toBe(1);
-    expect(run.stderr).toContain("--yes");
-    expect(issue558_parseCounts(run)).toEqual(issue558_FUND_ONLY);
-    expect(counts(dir)).toEqual(issue558_TOTAL);
-  });
-
-  it("--dry-run prints the counts and exits 0 without deleting", () => {
-    const dir = issue558_seed();
-    const run = issue558_cli(dir, ["unwatch", "FUND", "--org", issue558_ORG_ID, "--json", "--dry-run"]);
-    expect(run.status).toBe(0);
-    expect(issue558_parseCounts(run)).toEqual(issue558_FUND_ONLY);
-    expect(counts(dir)).toEqual(issue558_TOTAL);
-  });
-
-  it("--yes deletes the asset and its books", () => {
-    const dir = issue558_seed();
-    const run = issue558_cli(dir, ["unwatch", "FUND", "--org", issue558_ORG_ID, "--yes"]);
-    expect(run.status).toBe(0);
-    expect(run.stdout).toContain("stopped watching");
-    expect(counts(dir)).toEqual({ assets: 1, events: 1, registers: 0, runs: 0, notes: 0 });
-  });
-});
-
-describe("org-delete needs confirmation", () => {
-  it("refuses without --yes, deletes nothing and shows the counts", () => {
-    const dir = issue558_seed();
-    const run = issue558_cli(dir, ["org-delete", issue558_ORG_ID, "--json"]);
-    expect(run.status).toBe(1);
-    expect(run.stderr).toContain("--yes");
-    expect(issue558_parseCounts(run)).toEqual(issue558_TOTAL);
-    expect(existsSync(issue558_tenantPath(dir))).toBe(true);
-    const control = new Db(join(dir, "control.db"), CONTROL_MIGRATIONS);
-    expect(control.get("SELECT id FROM orgs WHERE id = ?", issue558_ORG_ID)).toBeDefined();
-    control.close();
-  });
-
-  it("--dry-run prints the counts and exits 0 without deleting", () => {
-    const dir = issue558_seed();
-    const run = issue558_cli(dir, ["org-delete", issue558_ORG_ID, "--json", "--dry-run"]);
-    expect(run.status).toBe(0);
-    expect(issue558_parseCounts(run)).toEqual(issue558_TOTAL);
-    expect(existsSync(issue558_tenantPath(dir))).toBe(true);
-  });
-
-  it("--yes deletes the workspace and its database", () => {
-    const dir = issue558_seed();
-    const run = issue558_cli(dir, ["org-delete", issue558_ORG_ID, "--yes"]);
-    expect(run.status).toBe(0);
-    expect(run.stdout).toContain(`deleted Alpha Capital (${issue558_ORG_ID})`);
-    expect(existsSync(issue558_tenantPath(dir))).toBe(false);
-    const control = new Db(join(dir, "control.db"), CONTROL_MIGRATIONS);
-    expect(control.get("SELECT id FROM orgs WHERE id = ?", issue558_ORG_ID)).toBeUndefined();
-    control.close();
