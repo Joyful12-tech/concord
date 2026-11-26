@@ -34,6 +34,7 @@ export const CLI_OPTIONS = {
   before: { type: "string" },
   json: { type: "boolean" },
   yes: { type: "boolean", short: "y" },
+  "dry-run": { type: "boolean" },
   help: { type: "boolean", short: "h" },
 } as const satisfies ParseArgsOptionsConfig;
 
@@ -106,7 +107,8 @@ export function describeArgsError(
     }
   }
   // Something parseArgs refused that the tokens do not show: keep its first line.
-  return `${String((err as Error).message).split("\n")[0]} ${HELP_HINT}`;
+  return `${String((err as Error).message).split("
+")[0]} ${HELP_HINT}`;
 }
 
 export const USAGE = `concord — reconcile tokenized securities on Stellar against the register
@@ -116,7 +118,8 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   watch <CODE:ISSUER | CONTRACT>   start indexing an asset
         [--network mainnet|testnet] [--name N] [--ignore A,B]
         [--from LEDGER] [--no-baseline] [--decimals D]
-  unwatch ASSET                    stop watching; deletes the asset and its books
+  unwatch ASSET [--yes] [--dry-run]
+                                   stop watching; deletes the asset and its books
   rebuild ASSET                    re-index from fresh opening balances; books stay
   assets                           list watched assets
   sync [ASSET]                     pull new events (every workspace when no --org)
@@ -145,9 +148,12 @@ Operator commands.
   signup-code [--note TEXT]        a code that lets one new workspace be created (CONCORD_SIGNUP=code)
   reset-link EMAIL                 a one-day link for setting a new password
   invite ORG EMAIL [--role owner|member]  create a workspace invitation link
-  org-delete ORG                   delete a workspace and everything in it
+  org-delete ORG [--yes] [--dry-run]
+                                   delete a workspace and everything in it
   backup DIR                       copy every database to DIR while the server runs
   serve                            run the API and dashboard
+
+unwatch and org-delete print deletion counts and require --yes (or a terminal confirmation); --dry-run only prints counts.
 
 ASSET is a code or a contract id. Add --json to most commands for machine-readable output,
 or --help (-h) to see this text. Settings come from the environment; see .env.example.`;
